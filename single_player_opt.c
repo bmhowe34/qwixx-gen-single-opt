@@ -68,8 +68,11 @@ typedef enum
 
 } QAction;
 
-#define NUM_COLORS 4
-#define NUM_TOTAL_STATES (5*62*62*62*62) // 73881680
+#define NUM_COLORS               4
+#define NUM_SINGLE_COLOR_STATES 57
+#define NUM_DUAL_COLOR_STATES   (NUM_SINGLE_COLOR_STATES*(NUM_SINGLE_COLOR_STATES+1)/2) //    1653
+#define NUM_FOUR_COLOR_STATES   (NUM_DUAL_COLOR_STATES  *(NUM_DUAL_COLOR_STATES  +1)/2) // 1367031
+#define NUM_TOTAL_STATES        (NUM_FOUR_COLOR_STATES  * 4 + 1)                        // 5468125
 
 typedef struct
 
@@ -85,8 +88,19 @@ typedef struct
     int numPenalties;
 } QwixxState;
 
+static float *Wvec = NULL;
+static int c1c2ToCombined[NUM_SINGLE_COLOR_STATES][NUM_SINGLE_COLOR_STATES];
+static int c12c24ToCombined[NUM_DUAL_COLOR_STATES][NUM_DUAL_COLOR_STATES];
+static int quadToC12[NUM_FOUR_COLOR_STATES];
+static int quadToC34[NUM_FOUR_COLOR_STATES];
+static int dualToC1 [NUM_DUAL_COLOR_STATES];
+static int dualToC2 [NUM_DUAL_COLOR_STATES];
+
+static inline float getWforState(QwixxState *state);
+static inline int colorStateTo62State(QColorState *color);
+
 inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalties, int colorStates[], 
-                int *newStateIx, int newColorStates[])
+                int *newStateIx, int newColorStates[], float *newStateW)
 {
     int retVal = 0;
 
@@ -102,11 +116,14 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
     }
     if (retVal && newStateIx)
     {
-        QColorState newState = state->color[color];
-        int newColorState;
-        newState.rightMark = diceVal;
-        newState.numMarks++;
-        newColorState = colorStateToIx(&newState);
+        QwixxState newQstate = *state;
+        newQstate.color[color].rightMark = diceVal;
+        newQstate.color[color].numMarks++;
+        //printf("Calling getWState for color %d diceVal %d\n", color, diceVal);
+        *newStateW = getWforState(&newQstate);
+
+        // FIXME - maybe not needed anymore??
+        int newColorState = colorStateTo62State(&newQstate.color[color]);
         newColorStates[0] = colorStates[0];
         newColorStates[1] = colorStates[1];
         newColorStates[2] = colorStates[2];
@@ -208,7 +225,7 @@ void constructStateFromIx(int ix, QwixxState *state)
   colorIx2State(blueIx  , &state->color[BLUE  ]);
 }
 
-inline int colorStateToIx(QColorState *color)
+static inline int colorStateTo62State(QColorState *color)
 {
   static const int lookupTbl[13][12] =
     {
@@ -240,19 +257,121 @@ inline int colorStateToIx(QColorState *color)
   return lookupTbl[rightMark][color->numMarks];
 }
 
-int convertStateToIx(QwixxState *state)
+static void initLookupTables()
+{
+  // Form c1c2ToCombined
+  int c1, c2, c12, c34, c1234;
+
+  memset(c1c2ToCombined, 0, sizeof(c1c2ToCombined));
+  memset(dualToC1,       0, sizeof(dualToC1));
+  memset(dualToC2,       0, sizeof(dualToC2));
+  c12 = 0;
+  for (c1 = 0; c1 < NUM_SINGLE_COLOR_STATES; c1++)
+  {
+    for (c2 = c1; c2 < NUM_SINGLE_COLOR_STATES; c2++)
+    {
+      c1c2ToCombined[c1][c2] = c12;
+      dualToC1[c12]          = c1;
+      dualToC2[c12]          = c2;
+      c12++;
+    }
+  }
+
+  memset(c12c24ToCombined, 0, sizeof(c12c24ToCombined));
+  memset(quadToC12,        0, sizeof(quadToC12));
+  memset(quadToC34,        0, sizeof(quadToC34));
+  c1234 = 0;
+  for (c12 = 0; c12 < NUM_DUAL_COLOR_STATES; c12++)
+  {
+    for (c34 = c12; c34 < NUM_DUAL_COLOR_STATES; c34++)
+    {
+      c12c24ToCombined[c12][c34] = c1234;
+      quadToC12[c1234]           = c12;
+      quadToC34[c1234]           = c34;
+      c1234++;
+    }
+  }
+}
+
+static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx, int blueIx, int numPenalties)
 {
   int retVal = 0;
-  int redIx    = colorStateToIx(&state->color[RED   ]);
-  int yellowIx = colorStateToIx(&state->color[YELLOW]);
-  int greenIx  = colorStateToIx(&state->color[GREEN ]);
-  int blueIx   = colorStateToIx(&state->color[BLUE  ]);
 
-  retVal += blueIx;
-  retVal += greenIx             * 62;
-  retVal += yellowIx            * 62 * 62;
-  retVal += redIx               * 62 * 62 * 62;
-  retVal += state->numPenalties * 62 * 62 * 62 * 62;
+  int ry, gb, rygb, tmp;
+
+  if (numPenalties >= 4)
+  {
+    retVal = NUM_TOTAL_STATES - 1;
+  }
+  else
+  {
+    // Force redIx <= yellowIx
+    if (redIx > yellowIx)
+    {
+      tmp      = redIx;
+      redIx    = yellowIx;
+      yellowIx = tmp;
+    }
+
+    // Force greenIx <= blueIx
+    if (greenIx > blueIx)
+    {
+      tmp     = greenIx;
+      greenIx = blueIx;
+      blueIx  = tmp;
+    }
+
+    ry = c1c2ToCombined[  redIx][yellowIx];
+    gb = c1c2ToCombined[greenIx][  blueIx];
+
+    // Force ry <= gb
+    if (ry > gb)
+    {
+      tmp = gb;
+      gb  = ry;
+      ry  = tmp;
+    }
+
+    rygb = c12c24ToCombined[ry][gb];
+
+    //printf("convert5tupleToIx(%d,%d,%d,%d,%d) --> ry %d, gb %d, rygb %d\n",
+    //   redIx, yellowIx, greenIx, blueIx, numPenalties, ry, gb, rygb);
+
+    retVal = numPenalties * NUM_FOUR_COLOR_STATES + rygb;
+  }
+
+  return retVal;
+}
+
+static inline int convert5tupleToIx(int redIx, int yellowIx, int greenIx, int blueIx, int numPenalties)
+{
+  int retVal = 0;
+
+  //Clip to be <= 56
+  int new_redIx    = (redIx   <=56) ? redIx    : 56;
+  int new_yellowIx = (yellowIx<=56) ? yellowIx : 56;
+  int new_greenIx  = (greenIx <=56) ? greenIx  : 56;
+  int new_blueIx   = (blueIx  <=56) ? blueIx   : 56;
+
+  retVal = convertClipped5tupleToIx(new_redIx, new_yellowIx, new_greenIx, new_blueIx, numPenalties);
+
+  return retVal;
+}
+
+static inline int convertRYGBPToIx(int RYGB[], int numPenalties)
+{
+  return convert5tupleToIx(RYGB[0], RYGB[1], RYGB[2], RYGB[3], numPenalties);
+}
+
+static inline int convertStateToIx(QwixxState *state)
+{
+  int retVal = 0;
+  int redIx    = colorStateTo62State(&state->color[RED   ]);
+  int yellowIx = colorStateTo62State(&state->color[YELLOW]);
+  int greenIx  = colorStateTo62State(&state->color[GREEN ]);
+  int blueIx   = colorStateTo62State(&state->color[BLUE  ]);
+
+  retVal = convert5tupleToIx(redIx, yellowIx, greenIx, blueIx, state->numPenalties);
 
   return retVal;
 }
@@ -309,47 +428,105 @@ int getScore(QwixxState *state)
   return score;
 }
 
-float *Wprev = NULL;
-float *Wnext = NULL;
-
-void calculateW0(float *W0)
+static float getWforState(QwixxState *state)
 {
-  int p = 0;
-  int s = 0;
-  int RYGB[4] = {0};
-  memset(&W0[0], 0, sizeof(float)*NUM_TOTAL_STATES);
+  float retVal = 0.0;
+  int ix = 0;
 
-  QwixxState state;
-  memset(&state, 0, sizeof(state));
-  state.color[RED   ].color = RED;
-  state.color[YELLOW].color = YELLOW;
-  state.color[GREEN ].color = GREEN;
-  state.color[BLUE  ].color = BLUE;
+  int redIx    = 0;
+  int yellowIx = 0;
+  int greenIx  = 0;
+  int blueIx   = 0;
+  int rClipped = 0;
+  int yClipped = 0;
+  int gClipped = 0;
+  int bClipped = 0;
+  int warning  = 0;
+  int valIsClipped = 0;
 
-  for (p = 0; p <= 4; p++)
+  if (isGameOver(state))
   {
-    state.numPenalties = p;
-    for (RYGB[0] = 0; RYGB[0] < 62; RYGB[0]++)
+    retVal = (float) getScore(state);
+  }
+  else
+  {
+    redIx    = colorStateTo62State(&state->color[RED   ]);
+    yellowIx = colorStateTo62State(&state->color[YELLOW]);
+    greenIx  = colorStateTo62State(&state->color[GREEN ]);
+    blueIx   = colorStateTo62State(&state->color[BLUE  ]);
+
+    if (redIx > 56)
     {
-      colorIx2State(RYGB[0], &state.color[RED]);
-      for (RYGB[1] = 0; RYGB[1] < 62; RYGB[1]++)
-      {
-        colorIx2State(RYGB[1], &state.color[YELLOW]);
-        for (RYGB[2] = 0; RYGB[2] < 62; RYGB[2]++)
-        {
-          colorIx2State(RYGB[2], &state.color[GREEN]);
-          for (RYGB[3] = 0; RYGB[3] < 62; RYGB[3]++)
-          {
-            colorIx2State(RYGB[3], &state.color[BLUE]);
-            W0[s] = (float) getScore(&state);
-            s++;
-          }
-        }
-      }
+      rClipped     = 56;
+      valIsClipped = 1;
+    }
+    else
+    {
+      rClipped = redIx;
+    }
+    if (yellowIx > 56)
+    {
+      yClipped     = 56;
+      valIsClipped = 1;
+    }
+    else
+    {
+      yClipped = yellowIx;
+    }
+    if (greenIx > 56)
+    {
+      gClipped     = 56;
+      valIsClipped = 1;
+    }
+    else
+    {
+      gClipped = greenIx;
+    }
+    if (blueIx > 56)
+    {
+      bClipped     = 56;
+      valIsClipped = 1;
+    }
+    else
+    {
+      bClipped = blueIx;
+    }
+
+    // 62stateIx =                  57,   58,   59,   60,   61
+    static const float offset[] = {8.0, 17.0, 27.0, 38.0, 50.0};
+
+    ix = convertClipped5tupleToIx(rClipped, yClipped, gClipped, bClipped, state->numPenalties);
+
+    retVal = Wvec[ix];
+    if (retVal == -1e15f)
+    {
+      printf("WARNING!\n");
+      warning = 1;
+    }
+
+    // Account for the fact that 56 undershoots some states
+    if (valIsClipped)
+    {
+      retVal += 
+         ((redIx    > rClipped ) ? offset[redIx    - rClipped - 1] : 0.0f) +
+         ((yellowIx > yClipped ) ? offset[yellowIx - yClipped - 1] : 0.0f) +
+         ((greenIx  > gClipped ) ? offset[greenIx  - gClipped - 1] : 0.0f) +
+         ((blueIx   > bClipped ) ? offset[blueIx   - bClipped - 1] : 0.0f);
     }
   }
 
-  printf("Analyzed %d states for W0\n", s);
+  if (warning)
+  {
+    printf("State %d [%d R:%d/%d(%d) Y:%d/%d(%d) G:%d/%d(%d) B:%d/%d(%d)], Wvec %.1f\n",
+           ix, state->numPenalties,
+           state->color[0].numMarks, state->color[0].rightMark, redIx,
+           state->color[1].numMarks, state->color[1].rightMark, yellowIx,
+           state->color[2].numMarks, state->color[2].rightMark, greenIx,
+           state->color[3].numMarks, state->color[3].rightMark, blueIx,
+           retVal);
+  }
+
+  return retVal;
 }
 
 inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBeforeStart)
@@ -370,30 +547,12 @@ inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBefo
   return bestIdx;
 }
 
-typedef struct
-{
-  int zeroBasedThreadID;
-  int nThreads;
-  int nStatesDone;
-  pthread_t thread_id;
-} CalcWNextParms;
-
-static void *calculateWnext(void *parms)
+static void *calculateWvec(void *parms)
 {
   int p = 0;
   int s = 0;
   int RYGB[4] = {0};
   const double inv6_to6 = 1.0 / (6*6*6*6*6*6);
-  CalcWNextParms *wnParms = (CalcWNextParms *) parms;
-
-  int nStatesPerThread = (NUM_TOTAL_STATES - 62*62*62*62 + wnParms->nThreads - 1) / wnParms->nThreads;
-  int myStartState = wnParms->zeroBasedThreadID * nStatesPerThread;
-  int myStopState  = (wnParms->zeroBasedThreadID + 1) * nStatesPerThread;
-
-  if (wnParms->zeroBasedThreadID == wnParms->nThreads - 1)
-  {
-    myStopState = NUM_TOTAL_STATES;
-  }
 
   QwixxState state;
   memset(&state, 0, sizeof(state));
@@ -402,389 +561,297 @@ static void *calculateWnext(void *parms)
   state.color[GREEN ].color = GREEN;
   state.color[BLUE  ].color = BLUE;
 
-  wnParms->nStatesDone = 0;
-
-  if (myStopState > NUM_TOTAL_STATES)
+  for (s = NUM_TOTAL_STATES - 1; s >= 0; s--)
   {
-    myStopState = NUM_TOTAL_STATES;
-  }
-
-  for (p = 0; p <= 4; p++)
-  {
-    state.numPenalties = p;
-    s = p * 62 * 62 * 62 * 62;
-    for (RYGB[0] = 0; RYGB[0] < 62; RYGB[0]++)
+    int numPenalties = s / NUM_FOUR_COLOR_STATES; // integer division
+    int rygbState    = s % NUM_FOUR_COLOR_STATES;
+    if (numPenalties >= 4)
     {
-      colorIx2State(RYGB[0], &state.color[RED]);
-      for (RYGB[1] = 0; RYGB[1] < 62; RYGB[1]++)
+      Wvec[s] = -1e100;
+    }
+    else
+    {
+      int ry = quadToC12[rygbState];
+      int gb = quadToC34[rygbState];
+
+      RYGB[0] = dualToC1[ry];
+      RYGB[1] = dualToC2[ry];
+      RYGB[2] = dualToC1[gb];
+      RYGB[3] = dualToC2[gb];
+
+      state.numPenalties = numPenalties;
+      colorIx2State(RYGB[0], &state.color[RED   ]);
+      colorIx2State(RYGB[1], &state.color[YELLOW]);
+      colorIx2State(RYGB[2], &state.color[GREEN ]);
+      colorIx2State(RYGB[3], &state.color[BLUE  ]);
+
+      // Shortcut for number of penalties
+      p = numPenalties;
+
+      if (isGameOver(&state))
       {
-        colorIx2State(RYGB[1], &state.color[YELLOW]);
-        for (RYGB[2] = 0; RYGB[2] < 62; RYGB[2]++)
+        Wvec[s] = -1e100;
+      }
+      else
+      {
+        // Roll the dice
+        int w1, w2, r, y, g, b;
+        double   actionReward[NUM_ACTIONS];
+        int    newColorStates[NUM_COLORS];
+        double theWnext = 0.0;
+
+        // "Was" means "White as"
+        QwixxState newTmpStateTookWasRED;
+        QwixxState newTmpStateTookWasYELLOW;
+        QwixxState newTmpStateTookWasGREEN;
+        QwixxState newTmpStateTookWasBLUE;
+        int        newTmpColStateTookWasRED   [NUM_COLORS];
+        int        newTmpColStateTookWasYELLOW[NUM_COLORS];
+        int        newTmpColStateTookWasGREEN [NUM_COLORS];
+        int        newTmpColStateTookWasBLUE  [NUM_COLORS];
+        int        canTakeWasRED    = 0;
+        int        canTakeWasYELLOW = 0;
+        int        canTakeWasGREEN  = 0;
+        int        canTakeWasBLUE   = 0;
+
         {
-          colorIx2State(RYGB[2], &state.color[GREEN]);
-          for (RYGB[3] = 0; RYGB[3] < 62; RYGB[3]++)
+          QwixxState stateWithAddtlPenalty = state;
+          stateWithAddtlPenalty.numPenalties++;
+          actionReward[PENALTY] = getWforState(&stateWithAddtlPenalty);
+        }
+
+        for (w1 = 1; w1 <= 6; w1++)
+        {
+          // w2 is always >= w1
+          for (w2 = w1; w2 <= 6; w2++)
           {
-            colorIx2State(RYGB[3], &state.color[BLUE]);
+            int w = w1 + w2;
+            // count some cases twice due to w2 looping limits optimizations
+            double pScale = (w1 == w2) ? inv6_to6 : (2*inv6_to6);
+            int newStateIx = 0;
+            float newStateW = 0.0f;
 
-            if (s < myStartState || s >= myStopState)
-            {
-              // Do nothing because it's not my work to do
+#define CHECK_W_AS_COLOR(COLORUPPER)                                                                                            \
+            actionReward[WHITE_AS_##COLORUPPER] = -1e9;                                                                         \
+            canTakeWas##COLORUPPER = 0;                                                                                         \
+            if (canTakeMark(&state, COLORUPPER, w, p, RYGB, &newStateIx, newTmpColStateTookWas##COLORUPPER, &newStateW))        \
+            {                                                                                                                   \
+              actionReward[WHITE_AS_##COLORUPPER] = newStateW;                                                                  \
+              newTmpStateTookWas##COLORUPPER = state;                                                                           \
+              colorIx2State(newTmpColStateTookWas##COLORUPPER[COLORUPPER], &newTmpStateTookWas##COLORUPPER.color[COLORUPPER]);  \
+              canTakeWas##COLORUPPER = ! isGameOver(&newTmpStateTookWas##COLORUPPER);                                           \
             }
-            else if (isGameOver(&state))
+
+            CHECK_W_AS_COLOR(RED)
+            CHECK_W_AS_COLOR(YELLOW)
+            CHECK_W_AS_COLOR(GREEN)
+            CHECK_W_AS_COLOR(BLUE)
+
+            int bestThruWhiteOnly = pickBestAction(actionReward, WHITE_AS_RED, WHITE_AS_BLUE, PENALTY);
+
+            for (r = 1; r <= 6; r++)
             {
-              // Do nothing. Carry over previous results
-              Wnext[s] = Wprev[s];
-              wnParms->nStatesDone++;
-            }
-            else
-            {
-              // Roll the dice
-              int w1, w2, r, y, g, b;
-              double   actionReward[NUM_ACTIONS];
-              int    newColorStates[NUM_COLORS];
-              double theWnext = 0.0;
+#define CHECK_LOW_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                             \
+              actionReward[LOW_##COLOR1UPPER##_ONLY] = -1e9;                                                     \
+              if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
+              {                                                                                                  \
+                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                              \
+              }                                                                                                  \
+              else if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
+              {                                                                                                  \
+                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                              \
+              }
 
-              // "Was" means "White as"
-              QwixxState newTmpStateTookWasRED;
-              QwixxState newTmpStateTookWasYELLOW;
-              QwixxState newTmpStateTookWasGREEN;
-              QwixxState newTmpStateTookWasBLUE;
-              int        newTmpColStateTookWasRED   [NUM_COLORS];
-              int        newTmpColStateTookWasYELLOW[NUM_COLORS];
-              int        newTmpColStateTookWasGREEN [NUM_COLORS];
-              int        newTmpColStateTookWasBLUE  [NUM_COLORS];
-              int        canTakeWasRED    = 0;
-              int        canTakeWasYELLOW = 0;
-              int        canTakeWasGREEN  = 0;
-              int        canTakeWasBLUE   = 0;
+#define CHECK_HI_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                              \
+              actionReward[HI_##COLOR1UPPER##_ONLY] = -1e9;                                                      \
+              if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
+              {                                                                                                  \
+                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                               \
+              }                                                                                                  \
+              else if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
+              {                                                                                                  \
+                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                               \
+              }
 
-              actionReward[PENALTY] = Wprev[s + 62*62*62*62];
+#define CHECK_W_AS_C1_THEN_C2_LOW(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                               \
+              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = -1e9;                     \
+              if (canTakeWas##COLOR1UPPER)                                                              \
+              {                                                                                         \
+                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,      \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
+                {                                                                                       \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;            \
+                }                                                                                       \
+                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p, \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
+                {                                                                                       \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;            \
+                }                                                                                       \
+              }
 
-              for (w1 = 1; w1 <= 6; w1++)
+#define CHECK_W_AS_C1_THEN_C2_HI(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                \
+              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = -1e9;                      \
+              if (canTakeWas##COLOR1UPPER)                                                              \
+              {                                                                                         \
+                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,      \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
+                {                                                                                       \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;             \
+                }                                                                                       \
+                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p, \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
+                {                                                                                       \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;             \
+                }                                                                                       \
+              }
+
+              CHECK_LOW_C1_ONLY(RED, r)
+              CHECK_W_AS_C1_THEN_C2_LOW(RED   , RED, r)
+              CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, RED, r)
+              CHECK_W_AS_C1_THEN_C2_LOW(GREEN , RED, r)
+              CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , RED, r)
+
+              int bestThruRed = pickBestAction(actionReward, 
+                          LOW_RED_ONLY, WHITE_AS_BLUE_THEN_LOW_RED, bestThruWhiteOnly);
+
+              // If it is possible to lock red, then check the high options, too
+              if (r == 6 && w2 == 6)
               {
-                // w2 is always >= w1
-                for (w2 = w1; w2 <= 6; w2++)
-                {
-                  int w = w1 + w2;
-                  // count some cases twice due to w2 looping limits optimizations
-                  double pScale = (w1 == w2) ? inv6_to6 : (2*inv6_to6);
-                  int newStateIx = 0;
+                CHECK_HI_C1_ONLY(RED, r);
+                CHECK_W_AS_C1_THEN_C2_HI(RED   , RED, r)
+                CHECK_W_AS_C1_THEN_C2_HI(YELLOW, RED, r)
+                CHECK_W_AS_C1_THEN_C2_HI(GREEN , RED, r)
+                CHECK_W_AS_C1_THEN_C2_HI(BLUE  , RED, r)
+                bestThruRed = pickBestAction(actionReward, 
+                          HI_RED_ONLY, WHITE_AS_BLUE_THEN_HI_RED, bestThruRed);
+              }
 
-#define CHECK_W_AS_COLOR(COLORUPPER)                                                                                                  \
-                  actionReward[WHITE_AS_##COLORUPPER] = -1e9;                                                                         \
-                  canTakeWas##COLORUPPER = 0;                                                                                         \
-                  if (canTakeMark(&state, COLORUPPER, w, p, RYGB, &newStateIx, newTmpColStateTookWas##COLORUPPER))                    \
-                  {                                                                                                                   \
-                    actionReward[WHITE_AS_##COLORUPPER] = Wprev[newStateIx];                                                          \
-                    newTmpStateTookWas##COLORUPPER = state;                                                                           \
-                    colorIx2State(newTmpColStateTookWas##COLORUPPER[COLORUPPER], &newTmpStateTookWas##COLORUPPER.color[COLORUPPER]);  \
-                    canTakeWas##COLORUPPER = ! isGameOver(&newTmpStateTookWas##COLORUPPER);                                           \
+              for (y = 1; y <= 6; y++)
+              {
+                CHECK_LOW_C1_ONLY(YELLOW, y)
+                CHECK_W_AS_C1_THEN_C2_LOW(RED   , YELLOW, y)
+                CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, YELLOW, y)
+                CHECK_W_AS_C1_THEN_C2_LOW(GREEN , YELLOW, y)
+                CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , YELLOW, y)
+
+                int bestThruYellow = pickBestAction(actionReward, 
+                            LOW_YELLOW_ONLY, WHITE_AS_BLUE_THEN_LOW_YELLOW, bestThruRed);
+
+                // If it is possible to lock yellow, then check the high options, too
+                if (y == 6 && w2 == 6)
+                {
+                  CHECK_HI_C1_ONLY(YELLOW, y);
+                  CHECK_W_AS_C1_THEN_C2_HI(RED   , YELLOW, y)
+                  CHECK_W_AS_C1_THEN_C2_HI(YELLOW, YELLOW, y)
+                  CHECK_W_AS_C1_THEN_C2_HI(GREEN , YELLOW, y)
+                  CHECK_W_AS_C1_THEN_C2_HI(BLUE  , YELLOW, y)
+                  bestThruYellow = pickBestAction(actionReward, 
+                            HI_YELLOW_ONLY, WHITE_AS_BLUE_THEN_HI_YELLOW, bestThruYellow);
+                }
+
+                for (g = 1; g <= 6; g++)
+                {
+                  CHECK_HI_C1_ONLY(GREEN, g)
+                  CHECK_W_AS_C1_THEN_C2_HI(RED   , GREEN, g)
+                  CHECK_W_AS_C1_THEN_C2_HI(YELLOW, GREEN, g)
+                  CHECK_W_AS_C1_THEN_C2_HI(GREEN , GREEN, g)
+                  CHECK_W_AS_C1_THEN_C2_HI(BLUE  , GREEN, g)
+
+                  int bestThruGreen = pickBestAction(actionReward, 
+                              HI_GREEN_ONLY, WHITE_AS_BLUE_THEN_HI_GREEN, bestThruYellow);
+
+                  // If it is possible to lock green, then check the low green, too
+                  if (g == 1 && w1 == 1)
+                  {
+                    CHECK_LOW_C1_ONLY(GREEN, g);
+                    CHECK_W_AS_C1_THEN_C2_LOW(RED   , GREEN, g)
+                    CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, GREEN, g)
+                    CHECK_W_AS_C1_THEN_C2_LOW(GREEN , GREEN, g)
+                    CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , GREEN, g)
+                    bestThruGreen = pickBestAction(actionReward, 
+                              LOW_GREEN_ONLY, WHITE_AS_BLUE_THEN_LOW_GREEN, bestThruGreen);
                   }
 
-                  CHECK_W_AS_COLOR(RED)
-                  CHECK_W_AS_COLOR(YELLOW)
-                  CHECK_W_AS_COLOR(GREEN)
-                  CHECK_W_AS_COLOR(BLUE)
-
-                  int bestThruWhiteOnly = pickBestAction(actionReward, WHITE_AS_RED, WHITE_AS_BLUE, PENALTY);
-
-                  for (r = 1; r <= 6; r++)
+                  for (b = 1; b <= 6; b++)
                   {
-#define CHECK_LOW_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                                   \
-                    actionReward[LOW_##COLOR1UPPER##_ONLY] = -1e9;                                                     \
-                    if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates))       \
-                    {                                                                                                  \
-                      actionReward[LOW_##COLOR1UPPER##_ONLY] = Wprev[newStateIx];                                      \
-                    }                                                                                                  \
-                    else if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates))  \
-                    {                                                                                                  \
-                      actionReward[LOW_##COLOR1UPPER##_ONLY] = Wprev[newStateIx];                                      \
-                    }
+                    CHECK_HI_C1_ONLY(BLUE, b)
+                    CHECK_W_AS_C1_THEN_C2_HI(RED   , BLUE, b)
+                    CHECK_W_AS_C1_THEN_C2_HI(YELLOW, BLUE, b)
+                    CHECK_W_AS_C1_THEN_C2_HI(GREEN , BLUE, b)
+                    CHECK_W_AS_C1_THEN_C2_HI(BLUE  , BLUE, b)
 
-#define CHECK_HI_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                                    \
-                    actionReward[HI_##COLOR1UPPER##_ONLY] = -1e9;                                                      \
-                    if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates))       \
-                    {                                                                                                  \
-                      actionReward[HI_##COLOR1UPPER##_ONLY] = Wprev[newStateIx];                                       \
-                    }                                                                                                  \
-                    else if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates))  \
-                    {                                                                                                  \
-                      actionReward[HI_##COLOR1UPPER##_ONLY] = Wprev[newStateIx];                                       \
-                    }
+                    int bestThruBlue = pickBestAction(actionReward, 
+                                HI_BLUE_ONLY, WHITE_AS_BLUE_THEN_HI_BLUE, bestThruGreen);
 
-#define CHECK_W_AS_C1_THEN_C2_LOW(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                     \
-                    actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = -1e9;                     \
-                    if (canTakeWas##COLOR1UPPER)                                                              \
-                    {                                                                                         \
-                      if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,      \
-                          newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates))                   \
-                      {                                                                                       \
-                        actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = Wprev[newStateIx];    \
-                      }                                                                                       \
-                      else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p, \
-                          newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates))                   \
-                      {                                                                                       \
-                        actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = Wprev[newStateIx];    \
-                      }                                                                                       \
-                    }
-
-#define CHECK_W_AS_C1_THEN_C2_HI(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                      \
-                    actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = -1e9;                      \
-                    if (canTakeWas##COLOR1UPPER)                                                              \
-                    {                                                                                         \
-                      if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,      \
-                          newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates))                   \
-                      {                                                                                       \
-                        actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = Wprev[newStateIx];     \
-                      }                                                                                       \
-                      else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p, \
-                          newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates))                   \
-                      {                                                                                       \
-                        actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = Wprev[newStateIx];     \
-                      }                                                                                       \
-                    }
-
-                    CHECK_LOW_C1_ONLY(RED, r)
-                    CHECK_W_AS_C1_THEN_C2_LOW(RED   , RED, r)
-                    CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, RED, r)
-                    CHECK_W_AS_C1_THEN_C2_LOW(GREEN , RED, r)
-                    CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , RED, r)
-
-                    int bestThruRed = pickBestAction(actionReward, 
-                                LOW_RED_ONLY, WHITE_AS_BLUE_THEN_LOW_RED, bestThruWhiteOnly);
-
-                    // If it is possible to lock red, then check the high options, too
-                    if (r == 6 && w2 == 6)
+                    // If it is possible to lock blue, then check the low blue, too
+                    if (b == 1 && w1 == 1)
                     {
-                      CHECK_HI_C1_ONLY(RED, r);
-                      CHECK_W_AS_C1_THEN_C2_HI(RED   , RED, r)
-                      CHECK_W_AS_C1_THEN_C2_HI(YELLOW, RED, r)
-                      CHECK_W_AS_C1_THEN_C2_HI(GREEN , RED, r)
-                      CHECK_W_AS_C1_THEN_C2_HI(BLUE  , RED, r)
-                      bestThruRed = pickBestAction(actionReward, 
-                                HI_RED_ONLY, WHITE_AS_BLUE_THEN_HI_RED, bestThruRed);
+                      CHECK_LOW_C1_ONLY(BLUE, b);
+                      CHECK_W_AS_C1_THEN_C2_LOW(RED   , BLUE, b)
+                      CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, BLUE, b)
+                      CHECK_W_AS_C1_THEN_C2_LOW(GREEN , BLUE, b)
+                      CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , BLUE, b)
+                      bestThruBlue = pickBestAction(actionReward, 
+                                LOW_BLUE_ONLY, WHITE_AS_BLUE_THEN_LOW_BLUE, bestThruBlue);
                     }
 
-                    for (y = 1; y <= 6; y++)
+                    theWnext += actionReward[bestThruBlue] * pScale;
+
+                    if (0)//actionReward[bestThruBlue] > 0.0 && bestThruBlue != PENALTY)
                     {
-                      CHECK_LOW_C1_ONLY(YELLOW, y)
-                      CHECK_W_AS_C1_THEN_C2_LOW(RED   , YELLOW, y)
-                      CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, YELLOW, y)
-                      CHECK_W_AS_C1_THEN_C2_LOW(GREEN , YELLOW, y)
-                      CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , YELLOW, y)
-
-                      int bestThruYellow = pickBestAction(actionReward, 
-                                  LOW_YELLOW_ONLY, WHITE_AS_BLUE_THEN_LOW_YELLOW, bestThruRed);
-
-                      // If it is possible to lock yellow, then check the high options, too
-                      if (y == 6 && w2 == 6)
-                      {
-                        CHECK_HI_C1_ONLY(YELLOW, y);
-                        CHECK_W_AS_C1_THEN_C2_HI(RED   , YELLOW, y)
-                        CHECK_W_AS_C1_THEN_C2_HI(YELLOW, YELLOW, y)
-                        CHECK_W_AS_C1_THEN_C2_HI(GREEN , YELLOW, y)
-                        CHECK_W_AS_C1_THEN_C2_HI(BLUE  , YELLOW, y)
-                        bestThruYellow = pickBestAction(actionReward, 
-                                  HI_YELLOW_ONLY, WHITE_AS_BLUE_THEN_HI_YELLOW, bestThruYellow);
-                      }
-
-                      for (g = 1; g <= 6; g++)
-                      {
-                        CHECK_HI_C1_ONLY(GREEN, g)
-                        CHECK_W_AS_C1_THEN_C2_HI(RED   , GREEN, g)
-                        CHECK_W_AS_C1_THEN_C2_HI(YELLOW, GREEN, g)
-                        CHECK_W_AS_C1_THEN_C2_HI(GREEN , GREEN, g)
-                        CHECK_W_AS_C1_THEN_C2_HI(BLUE  , GREEN, g)
-
-                        int bestThruGreen = pickBestAction(actionReward, 
-                                    HI_GREEN_ONLY, WHITE_AS_BLUE_THEN_HI_GREEN, bestThruYellow);
-
-                        // If it is possible to lock green, then check the low green, too
-                        if (g == 1 && w1 == 1)
-                        {
-                          CHECK_LOW_C1_ONLY(GREEN, g);
-                          CHECK_W_AS_C1_THEN_C2_LOW(RED   , GREEN, g)
-                          CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, GREEN, g)
-                          CHECK_W_AS_C1_THEN_C2_LOW(GREEN , GREEN, g)
-                          CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , GREEN, g)
-                          bestThruGreen = pickBestAction(actionReward, 
-                                    LOW_GREEN_ONLY, WHITE_AS_BLUE_THEN_LOW_GREEN, bestThruGreen);
-                        }
-
-                        for (b = 1; b <= 6; b++)
-                        {
-                          CHECK_HI_C1_ONLY(BLUE, b)
-                          CHECK_W_AS_C1_THEN_C2_HI(RED   , BLUE, b)
-                          CHECK_W_AS_C1_THEN_C2_HI(YELLOW, BLUE, b)
-                          CHECK_W_AS_C1_THEN_C2_HI(GREEN , BLUE, b)
-                          CHECK_W_AS_C1_THEN_C2_HI(BLUE  , BLUE, b)
-
-                          int bestThruBlue = pickBestAction(actionReward, 
-                                      HI_BLUE_ONLY, WHITE_AS_BLUE_THEN_HI_BLUE, bestThruGreen);
-
-                          // If it is possible to lock blue, then check the low blue, too
-                          if (b == 1 && w1 == 1)
-                          {
-                            CHECK_LOW_C1_ONLY(BLUE, b);
-                            CHECK_W_AS_C1_THEN_C2_LOW(RED   , BLUE, b)
-                            CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, BLUE, b)
-                            CHECK_W_AS_C1_THEN_C2_LOW(GREEN , BLUE, b)
-                            CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , BLUE, b)
-                            bestThruBlue = pickBestAction(actionReward, 
-                                      LOW_BLUE_ONLY, WHITE_AS_BLUE_THEN_LOW_BLUE, bestThruBlue);
-                          }
-
-                          theWnext += actionReward[bestThruBlue] * pScale;
-
-                          if (0)//actionReward[bestThruBlue] > 0.0 && bestThruBlue != PENALTY)
-                          {
-                            printf("State %d [%d R:%d/%d Y:%d/%d G:%d/%d B:%d/%d], "
-                                   "Dice [W:%d %d R:%d Y:%d G:%d B:%d] Action %d Reward %.1f "
-                                   "Rewards: %.1f %.1f %.1f %.1f %.1f\n",
-                                   s, p, 
-                                   state.color[0].numMarks, state.color[0].rightMark,
-                                   state.color[1].numMarks, state.color[1].rightMark,
-                                   state.color[2].numMarks, state.color[2].rightMark,
-                                   state.color[3].numMarks, state.color[3].rightMark,
-                                   w1, w2, r, y, g, b, bestThruBlue, actionReward[bestThruBlue],
-                                   actionReward[0],
-                                   actionReward[1],
-                                   actionReward[2],
-                                   actionReward[3],
-                                   actionReward[4]);
-                          }
-                        } // b
-                      } //g
-                    } // y
-                  } // r
-                } // w2
-              } // w1
-              wnParms->nStatesDone++;
-              Wnext[s] = (float) theWnext;
-            } // else game not over
-            s++;
-            //if (p==0 && s%1000==0){printf("s = %d\n", s);}
-          }
-        }
-      }
-    }
-  } // end p loop
-  printf("End thread ID %d\n", wnParms->zeroBasedThreadID);
-}
-
-#define MAX_THREADS 1024
-
-void CalcWNextWithMultiThreads(int nThreads)
-{
-  CalcWNextParms parms[MAX_THREADS];
-  int s[MAX_THREADS];
-  void *res;
-  int loop;
-  int done = 0;
-
-  for (loop = 0; loop < nThreads; loop++)
-  {
-    parms[loop].zeroBasedThreadID = loop;
-    parms[loop].nThreads = nThreads;
-    parms[loop].nStatesDone = 0;
-
-    s[loop] = pthread_create(&parms[loop].thread_id, NULL,
-                    &calculateWnext, &parms[loop]);
-  }
-
-  while (!done)
-  {
-    int nStatesDone = 0;
-    for (loop = 0; loop < nThreads; loop++)
+                      printf("State %d [%d R:%d/%d Y:%d/%d G:%d/%d B:%d/%d], "
+                             "Dice [W:%d %d R:%d Y:%d G:%d B:%d] Action %d Reward %.1f "
+                             "Rewards: %.1f %.1f %.1f %.1f %.1f\n",
+                             s, p, 
+                             state.color[0].numMarks, state.color[0].rightMark,
+                             state.color[1].numMarks, state.color[1].rightMark,
+                             state.color[2].numMarks, state.color[2].rightMark,
+                             state.color[3].numMarks, state.color[3].rightMark,
+                             w1, w2, r, y, g, b, bestThruBlue, actionReward[bestThruBlue],
+                             actionReward[0],
+                             actionReward[1],
+                             actionReward[2],
+                             actionReward[3],
+                             actionReward[4]);
+                    }
+                  } // b
+                } //g
+              } // y
+            } // r
+          } // w2
+        } // w1
+        Wvec[s] = theWnext;
+      } // end else game not over
+    } // end else numPenalties < 4
+    if ((NUM_TOTAL_STATES - s) % 1000 == 0)
     {
-      nStatesDone += parms[loop].nStatesDone;
+      printf("% 8d / % 8d states complete\n", NUM_TOTAL_STATES - s, NUM_TOTAL_STATES);
     }
-    if (nStatesDone >= NUM_TOTAL_STATES)
-    {
-      done = 1;
-    }
-    printf("nStatesDone = %d\n", nStatesDone);
-    sleep(1);
-  }
-
-  for (loop = 0; loop < nThreads; loop++)
-  {
-    s[loop] = pthread_join(parms[loop].thread_id, &res);
-  }
-}
+  } // end s loop
+} // end calculateWvec()
 
 int main(int argc, char *argv[])
 {
     FILE *fp = NULL;
-    size_t bytes_read = 0;
-    int nThreads = 0;
-    int Wnum = 0;
     char filenameBuf[128];
 
-    if (argc > 2)
+    initLookupTables();
+
+    Wvec = malloc(sizeof(float)*NUM_TOTAL_STATES);
+    int i;
+    for (i = 0; i < NUM_TOTAL_STATES; i++)
     {
-      Wnum = atoi(argv[1]);
-      nThreads = atoi(argv[2]);
-      if (nThreads > 0 && nThreads < MAX_THREADS)
-      {
-        printf("Program will use %d threads\n", nThreads);
-      }
-      else
-      {
-        printf("Command line argument said to use %d threads but that is out of range...will just use 1\n", nThreads);
-        nThreads = 1;
-      }
-    }
-    else if (argc > 1)
-    {
-      Wnum = atoi(argv[1]);
-      nThreads = 1;
-    }
-    else
-    {
-      Wnum = 0;
-      nThreads = 1;
+      Wvec[i] = -1e15f;
     }
 
-    printf("Calculating Wnum = %d\n", Wnum);
+    calculateWvec(NULL);
 
-    Wprev = malloc(sizeof(float)*NUM_TOTAL_STATES);
-    Wnext = malloc(sizeof(float)*NUM_TOTAL_STATES);
-
-    if (Wnum == 0)
-    {
-      calculateW0(Wnext);
-    }
-    else if (Wnum > 0)
-    {
-      snprintf(filenameBuf, sizeof(filenameBuf), "qwixxN_W%02d.bin", Wnum-1);
-      printf("Reading %s for Wprev...\n", filenameBuf);
-      fp = fopen(filenameBuf,"rb");
-      if (fp)
-      {
-        bytes_read = fread(Wprev, sizeof(float)*NUM_TOTAL_STATES, 1, fp);
-        fclose(fp);
-      }
-      else
-      {
-        printf("File not found...exiting\n");
-        return -1;
-      }
-
-      memset(Wnext,  0, sizeof(float)*NUM_TOTAL_STATES);
-
-      // Calculate Wnext
-      printf("Calculating Wnext ...\n");
-      CalcWNextWithMultiThreads(nThreads);
-      //calculateWnext();
-    }
-
-    snprintf(filenameBuf, sizeof(filenameBuf), "qwixxN_W%02d.bin", Wnum);
+    snprintf(filenameBuf, sizeof(filenameBuf), "qwixx.bin");
     printf("Saving results to %s ...\n", filenameBuf);
     fp = fopen(filenameBuf,"wb");
     if (fp)
     {
-      fwrite(Wnext, sizeof(float)*NUM_TOTAL_STATES, 1, fp);
+      fwrite(Wvec, sizeof(float)*NUM_TOTAL_STATES, 1, fp);
       fclose(fp);
     }
 
