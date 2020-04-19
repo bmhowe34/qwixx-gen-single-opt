@@ -43,7 +43,13 @@ typedef enum
   WHITE_AS_GREEN_THEN_HI_BLUE,
   WHITE_AS_BLUE_THEN_HI_BLUE,
 
-  // These options are only of interest when potentially locking a color
+  // These options are only of interest when potentially locking a color. For
+  // example, when NOT locking a color, if given a choice between LOW_RED_ONLY
+  // (the lower sum of w1+red) and HI_RED_ONLY (the higher sum of (w2+red), you
+  // would normally never choose HI_RED_ONLY because that just *takes away*
+  // from future possible points. However, when the higher sum (w2+red) would
+  // lock the red row, that is worthy of being considered every time it is
+  // possible, as that may be the best choice.
   HI_RED_ONLY,                     // 25
   WHITE_AS_RED_THEN_HI_RED,
   WHITE_AS_YELLOW_THEN_HI_RED,
@@ -158,11 +164,15 @@ static int dualToC2 [NUM_DUAL_COLOR_STATES];
 
 // Function prototypes
 static inline float getWforState       (QwixxState  *state);
+static inline float getWforStateOpt    (QwixxState  *state, int r62ix, int y62ix, int g62ix, int b62ix);
 static inline int   colorStateTo62State(QColorState *color);
+
+static inline int getScore(QwixxState *state);
 
 // Returns 1 if it is legal to take a move; 0 otherwise Also returns the W
 // value for that new state. Note that this function is called A LOT.
-inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalties, int colorStates[], 
+inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalties,
+                int colorStates[],       // the [0-61] color state for each of the 4 colors (INPUT)
                 // Outputs
                 int   *newStateIx,       // 0-NUM_GAME_STATES-1
                 int    newColorStates[], // The state of each color, [0-61]
@@ -172,12 +182,12 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
 
     if (color == RED || color == YELLOW)
     {
-        retVal = diceVal >       state->color[color].rightMark && 
+        retVal = diceVal >       state->color[color].rightMark &&
                 (diceVal < 12 || state->color[color].numMarks >= 5);
     }
-    else
+    else // green or blue
     {
-        retVal = (diceVal <       state->color[color].rightMark || state->color[color].numMarks == 0) && 
+        retVal = (diceVal <       state->color[color].rightMark || state->color[color].numMarks == 0) &&
                  (diceVal >  2 || state->color[color].numMarks >= 5);
     }
     if (retVal && newStateIx)
@@ -186,19 +196,37 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
         newQstate.color[color].rightMark = diceVal;
         newQstate.color[color].numMarks++;
         //printf("Calling getWState for color %d diceVal %d\n", color, diceVal);
-        *newStateW = getWforState(&newQstate);
 
-        int newColorState = colorStateTo62State(&newQstate.color[color]);
-        newColorStates[0] = colorStates[0];
-        newColorStates[1] = colorStates[1];
-        newColorStates[2] = colorStates[2];
-        newColorStates[3] = colorStates[3];
-        newColorStates[color] = newColorState;
+        // Calculate newColorStates[]
+        newColorStates[0]     = colorStates[0];
+        newColorStates[1]     = colorStates[1];
+        newColorStates[2]     = colorStates[2];
+        newColorStates[3]     = colorStates[3];
+        newColorStates[color] = colorStateTo62State(&newQstate.color[color]);
+
+        // Shortcut to see if the game is over by seeing if two or more colors
+        // are locked. This has to be done before calling getWforStateOpt().
+        if ( (int)(newColorStates[0] >= 56) +
+             (int)(newColorStates[1] >= 56) +
+             (int)(newColorStates[2] >= 56) +
+             (int)(newColorStates[3] >= 56) >= 2)
+        {
+          *newStateW = getScore(&newQstate);
+        }
+        else
+        {
+          *newStateW = getWforStateOpt(&newQstate,
+                                       newColorStates[0],
+                                       newColorStates[1],
+                                       newColorStates[2],
+                                       newColorStates[3]);
+        }
+
         *newStateIx = numPenalties           * 62*62*62*62 +
                       newColorStates[RED   ] * 62*62*62    +
                       newColorStates[YELLOW] * 62*62       +
                       newColorStates[GREEN ] * 62          +
-                      newColorStates[BLUE  ];          
+                      newColorStates[BLUE  ];
     }
 
     return retVal;
@@ -415,7 +443,7 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
   return retVal;
 }
 
-int isGameOver(QwixxState *state)
+static inline int isGameOver(QwixxState *state)
 {
   int retVal = 0;
   if (state->numPenalties >= 4)
@@ -438,7 +466,7 @@ int isGameOver(QwixxState *state)
   return retVal;
 }
 
-int getColorScore(QColorState *color)
+static inline int getColorScore(QColorState *color)
 {
   // Index by number of marks. Add 1 for "lock" bonus
   int scores[] = {0,1,3,6,10,15,21,28,36,45,55,66,78};
@@ -455,7 +483,7 @@ int getColorScore(QColorState *color)
   return scores[isLocked + color->numMarks];
 }
 
-int getScore(QwixxState *state)
+static inline int getScore(QwixxState *state)
 {
   int score = 0;
 
@@ -469,6 +497,78 @@ int getScore(QwixxState *state)
   return score;
 }
 
+// Optimized function for getWforState. There are 2 critical assumptions that
+// must be met before using this optimized version of the function.
+// 1. The "62 index" values must be consistent with the "state" parameter.
+// 2. The state must not correspond to a "game over" state
+static inline float getWforStateOpt(QwixxState *state, int r62ix, int y62ix, int g62ix, int b62ix)
+{
+  float retVal     = 0.0;
+  int ix           = 0;
+
+  int rClipped     = 0;
+  int yClipped     = 0;
+  int gClipped     = 0;
+  int bClipped     = 0;
+  int warning      = 0;
+  int valIsClipped = 0;
+
+#define CLIP_CHECK(colorIx, cClipped, valIsClipped)  \
+  if (colorIx > 56)                                  \
+  {                                                  \
+    cClipped     = 56;                               \
+    valIsClipped = 1;                                \
+  }                                                  \
+  else                                               \
+  {                                                  \
+    cClipped = colorIx;                              \
+  }
+
+  CLIP_CHECK(r62ix, rClipped, valIsClipped)
+  CLIP_CHECK(y62ix, yClipped, valIsClipped)
+  CLIP_CHECK(g62ix, gClipped, valIsClipped)
+  CLIP_CHECK(b62ix, bClipped, valIsClipped)
+
+  // The following array helps account that state 56 is equivalent to states
+  // 57-61, except for the number of points that has been earned by the state.
+
+  // 62stateIx =                  57,   58,   59,   60,   61
+  static const float offset[] = {8.0, 17.0, 27.0, 38.0, 50.0};
+
+  ix = convertClipped5tupleToIx(rClipped, yClipped, gClipped, bClipped, state->numPenalties);
+
+  retVal = Wvec[ix];
+  if (retVal == WVEC_END_OF_GAME)
+  {
+    printf("WARNING!\n");
+    warning = 1;
+  }
+
+  // Account for the fact that 56 undershoots some states
+  if (valIsClipped)
+  {
+    retVal +=
+       ((r62ix > rClipped ) ? offset[r62ix - rClipped - 1] : 0.0f) +
+       ((y62ix > yClipped ) ? offset[y62ix - yClipped - 1] : 0.0f) +
+       ((g62ix > gClipped ) ? offset[g62ix - gClipped - 1] : 0.0f) +
+       ((b62ix > bClipped ) ? offset[b62ix - bClipped - 1] : 0.0f);
+  }
+
+  if (warning)
+  {
+    printf("State %d [%d R:%d/%d(%d) Y:%d/%d(%d) G:%d/%d(%d) B:%d/%d(%d)], Wvec %.1f\n",
+           ix, state->numPenalties,
+           state->color[0].numMarks, state->color[0].rightMark, r62ix,
+           state->color[1].numMarks, state->color[1].rightMark, y62ix,
+           state->color[2].numMarks, state->color[2].rightMark, g62ix,
+           state->color[3].numMarks, state->color[3].rightMark, b62ix,
+           retVal);
+    exit(-1);
+  }
+
+  return retVal;
+}
+
 // Prior to the state reduction optimization, this function was a trival
 // conversion from QwixxState to an index, followed by a lookup into Wvec[]
 // with the new index.  However, it is a bit more complicated now that we have
@@ -476,18 +576,10 @@ int getScore(QwixxState *state)
 static float getWforState(QwixxState *state)
 {
   float retVal     = 0.0;
-  int ix           = 0;
-
-  int redIx        = 0;
-  int yellowIx     = 0;
-  int greenIx      = 0;
-  int blueIx       = 0;
-  int rClipped     = 0;
-  int yClipped     = 0;
-  int gClipped     = 0;
-  int bClipped     = 0;
-  int warning      = 0;
-  int valIsClipped = 0;
+  int   redIx      = 0;
+  int   yellowIx   = 0;
+  int   greenIx    = 0;
+  int   blueIx     = 0;
 
   // Wvec[] is invalid for a "game over" state since a single "game over" state
   // can correspond to many actual scores.
@@ -502,58 +594,7 @@ static float getWforState(QwixxState *state)
     greenIx  = colorStateTo62State(&state->color[GREEN ]);
     blueIx   = colorStateTo62State(&state->color[BLUE  ]);
 
-#define CLIP_CHECK(colorIx, cClipped, valIsClipped)    \
-    if (colorIx > 56)                                  \
-    {                                                  \
-      cClipped     = 56;                               \
-      valIsClipped = 1;                                \
-    }                                                  \
-    else                                               \
-    {                                                  \
-      cClipped = colorIx;                              \
-    }
-
-    CLIP_CHECK(redIx,    rClipped, valIsClipped)
-    CLIP_CHECK(yellowIx, yClipped, valIsClipped)
-    CLIP_CHECK(greenIx,  gClipped, valIsClipped)
-    CLIP_CHECK(blueIx,   bClipped, valIsClipped)
-
-    // The following array helps account that state 56 is equivalent to states
-    // 57-61, except for the number of points that has been earned by the state.
-
-    // 62stateIx =                  57,   58,   59,   60,   61
-    static const float offset[] = {8.0, 17.0, 27.0, 38.0, 50.0};
-
-    ix = convertClipped5tupleToIx(rClipped, yClipped, gClipped, bClipped, state->numPenalties);
-
-    retVal = Wvec[ix];
-    if (retVal == WVEC_END_OF_GAME)
-    {
-      printf("WARNING!\n");
-      warning = 1;
-    }
-
-    // Account for the fact that 56 undershoots some states
-    if (valIsClipped)
-    {
-      retVal += 
-         ((redIx    > rClipped ) ? offset[redIx    - rClipped - 1] : 0.0f) +
-         ((yellowIx > yClipped ) ? offset[yellowIx - yClipped - 1] : 0.0f) +
-         ((greenIx  > gClipped ) ? offset[greenIx  - gClipped - 1] : 0.0f) +
-         ((blueIx   > bClipped ) ? offset[blueIx   - bClipped - 1] : 0.0f);
-    }
-  }
-
-  if (warning)
-  {
-    printf("State %d [%d R:%d/%d(%d) Y:%d/%d(%d) G:%d/%d(%d) B:%d/%d(%d)], Wvec %.1f\n",
-           ix, state->numPenalties,
-           state->color[0].numMarks, state->color[0].rightMark, redIx,
-           state->color[1].numMarks, state->color[1].rightMark, yellowIx,
-           state->color[2].numMarks, state->color[2].rightMark, greenIx,
-           state->color[3].numMarks, state->color[3].rightMark, blueIx,
-           retVal);
-    exit(-1);
+    retVal   = getWforStateOpt(state, redIx, yellowIx, greenIx, blueIx);
   }
 
   return retVal;
@@ -579,7 +620,7 @@ inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBefo
 }
 
 // This is the main function that calculates the W vector. It takes a very long time.
-static void calculateWvec()
+static void calculateWvec(int num_iterations)
 {
   int          p                = 0;  // shortcut for number of penalties
   int          s                = 0;  // state loop index
@@ -587,6 +628,17 @@ static void calculateWvec()
 
   // Probability of each 6-dice throw (each die has 6 possible outcomes)
   const double inv6_to6 = 1.0 / (6*6*6*6*6*6);
+
+  // Allow the main loop to be cut short for timing purposes
+  int stopping_state_index = 0;
+  if (num_iterations > 0)
+  {
+    stopping_state_index = NUM_MARKOV_STATES - num_iterations;
+    if (stopping_state_index < 0)
+    {
+      stopping_state_index = 0;
+    }
+  }
 
   QwixxState state;
   memset(&state, 0, sizeof(state));
@@ -597,7 +649,7 @@ static void calculateWvec()
 
   // Loop through the states backwards. Each loop only looks at state indices
   // >= this current s, so it only works when looping backward.
-  for (s = NUM_MARKOV_STATES - 1; s >= 0; s--)
+  for (s = NUM_MARKOV_STATES - 1; s >= stopping_state_index; s--)
   {
     int numPenalties = s / NUM_FOUR_COLOR_STATES; // integer division
     int rygbState    = s % NUM_FOUR_COLOR_STATES;
@@ -669,6 +721,8 @@ static void calculateWvec()
             int newStateIx = 0;
             float newStateW = 0.0f;
 
+// This macro checks to see if you can take the sum of the two white dice as
+// one of the colors. This is the first choice a Qwixx player must evaluate.
 #define CHECK_W_AS_COLOR(COLORUPPER)                                                                                            \
             actionReward[WHITE_AS_##COLORUPPER] = -1e9;                                                                         \
             canTakeWas##COLORUPPER = 0;                                                                                         \
@@ -685,71 +739,106 @@ static void calculateWvec()
             CHECK_W_AS_COLOR(GREEN)
             CHECK_W_AS_COLOR(BLUE)
 
+            // Evaluate the best option that has been calculated so far
             int bestThruWhiteOnly = pickBestAction(actionReward, WHITE_AS_RED, WHITE_AS_BLUE, PENALTY);
 
             for (r = 1; r <= 6; r++)
             {
-#define CHECK_LOW_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                             \
-              actionReward[LOW_##COLOR1UPPER##_ONLY] = -1e9;                                                     \
+// CHECK_LOW_C1_ONLY:
+// This macro checks to see if you can take the lower of (w1,w2) (which is
+// always w1) plus a colored die as that color. This is denoted as "Choice 1"
+// (C1). If w1+colorDiceVal is unable to be played, evaluate whether or not you
+// can take w2+colorDiceVal. This populates the actionReward for:
+// - LOW_RED_ONLY
+// - LOW_YELLOW_ONLY
+// - LOW_GREEN_ONLY
+// - LOW_BLUE_ONLY
+#define CHECK_LOW_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                                         \
+              actionReward[LOW_##COLOR1UPPER##_ONLY] = -1e9;                                                                 \
               if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
-              {                                                                                                  \
-                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                              \
-              }                                                                                                  \
+              {                                                                                                              \
+                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                          \
+              }                                                                                                              \
               else if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
-              {                                                                                                  \
-                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                              \
+              {                                                                                                              \
+                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                          \
               }
 
-#define CHECK_HI_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                              \
-              actionReward[HI_##COLOR1UPPER##_ONLY] = -1e9;                                                      \
+// CHECK_HI_C1_ONLY:
+// Same as CHECK_LOW_C1_ONLY, except it evaluates w2+colorDiceVal first and
+// w1+colorDiceVal second. This populates the actionReward for:
+// - HI_RED_ONLY
+// - HI_YELLOW_ONLY
+// - HI_GREEN_ONLY
+// - HI_BLUE_ONLY
+#define CHECK_HI_C1_ONLY(COLOR1UPPER, colorDiceVal)                                                                          \
+              actionReward[HI_##COLOR1UPPER##_ONLY] = -1e9;                                                                  \
               if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
-              {                                                                                                  \
-                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                               \
-              }                                                                                                  \
+              {                                                                                                              \
+                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                                           \
+              }                                                                                                              \
               else if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
-              {                                                                                                  \
-                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                               \
+              {                                                                                                              \
+                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                                           \
               }
 
-#define CHECK_W_AS_C1_THEN_C2_LOW(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                               \
-              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = -1e9;                     \
-              if (canTakeWas##COLOR1UPPER)                                                              \
-              {                                                                                         \
-                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,      \
-                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
-                {                                                                                       \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;            \
-                }                                                                                       \
-                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p, \
-                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
-                {                                                                                       \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;            \
-                }                                                                                       \
+// CHECK_W_AS_C1_THEN_C2_LOW:
+// This macro checks to see if you can take Choice 1 (C1) (two whites marked as
+// a color) followed by Choice 2 (C2), where C2 is the lower of the two
+// possible sums (w1+colorDiceVal vs w2+colorDiceVal). If the lower sum is
+// unable to be played, evaluate the higher sum. This populates actionReward
+// for:
+// - WHITE_AS_RED_THEN_LOW_RED   , WHITE_AS_RED_THEN_LOW_YELLOW   , WHITE_AS_RED_THEN_LOW_GREEN   , WHITE_AS_RED_THEN_LOW_BLUE
+// - WHITE_AS_YELLOW_THEN_LOW_RED, WHITE_AS_YELLOW_THEN_LOW_YELLOW, WHITE_AS_YELLOW_THEN_LOW_GREEN, WHITE_AS_YELLOW_THEN_LOW_BLUE
+// - WHITE_AS_GREEN_THEN_LOW_RED , WHITE_AS_GREEN_THEN_LOW_YELLOW , WHITE_AS_GREEN_THEN_LOW_GREEN , WHITE_AS_GREEN_THEN_LOW_BLUE
+// - WHITE_AS_BLUE_THEN_LOW_RED  , WHITE_AS_BLUE_THEN_LOW_YELLOW  , WHITE_AS_BLUE_THEN_LOW_GREEN  , WHITE_AS_BLUE_THEN_LOW_BLUE
+#define CHECK_W_AS_C1_THEN_C2_LOW(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                                    \
+              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = -1e9;                                          \
+              if (canTakeWas##COLOR1UPPER)                                                                                   \
+              {                                                                                                              \
+                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,                           \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
+                {                                                                                                            \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                                 \
+                }                                                                                                            \
+                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,                      \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
+                {                                                                                                            \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                                 \
+                }                                                                                                            \
               }
 
-#define CHECK_W_AS_C1_THEN_C2_HI(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                \
-              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = -1e9;                      \
-              if (canTakeWas##COLOR1UPPER)                                                              \
-              {                                                                                         \
-                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,      \
-                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
-                {                                                                                       \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;             \
-                }                                                                                       \
-                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p, \
-                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))       \
-                {                                                                                       \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;             \
-                }                                                                                       \
+// CHECK_W_AS_C1_THEN_C2_HI:
+// Same as CHECK_W_AS_C1_THEN_C2_LOW, except it evaluates w2+colorDiceVal first
+// and w1+colorDiceVal second. This populates actionReward for:
+// - WHITE_AS_RED_THEN_HI_RED   , WHITE_AS_RED_THEN_HI_YELLOW   , WHITE_AS_RED_THEN_HI_GREEN   , WHITE_AS_RED_THEN_HI_BLUE
+// - WHITE_AS_YELLOW_THEN_HI_RED, WHITE_AS_YELLOW_THEN_HI_YELLOW, WHITE_AS_YELLOW_THEN_HI_GREEN, WHITE_AS_YELLOW_THEN_HI_BLUE
+// - WHITE_AS_GREEN_THEN_HI_RED , WHITE_AS_GREEN_THEN_HI_YELLOW , WHITE_AS_GREEN_THEN_HI_GREEN , WHITE_AS_GREEN_THEN_HI_BLUE
+// - WHITE_AS_BLUE_THEN_HI_RED  , WHITE_AS_BLUE_THEN_HI_YELLOW  , WHITE_AS_BLUE_THEN_HI_GREEN  , WHITE_AS_BLUE_THEN_HI_BLUE
+#define CHECK_W_AS_C1_THEN_C2_HI(COLOR1UPPER, COLOR2UPPER, colorDiceVal)                                                     \
+              actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = -1e9;                                           \
+              if (canTakeWas##COLOR1UPPER)                                                                                   \
+              {                                                                                                              \
+                if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,                           \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
+                {                                                                                                            \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                  \
+                }                                                                                                            \
+                else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,                      \
+                    newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
+                {                                                                                                            \
+                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                  \
+                }                                                                                                            \
               }
 
+              // Evaluate all the options that just include the white dice and the red die
               CHECK_LOW_C1_ONLY(RED, r)
               CHECK_W_AS_C1_THEN_C2_LOW(RED   , RED, r)
               CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, RED, r)
               CHECK_W_AS_C1_THEN_C2_LOW(GREEN , RED, r)
               CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , RED, r)
 
-              int bestThruRed = pickBestAction(actionReward, 
+              int bestThruRed = pickBestAction(actionReward,
                           LOW_RED_ONLY, WHITE_AS_BLUE_THEN_LOW_RED, bestThruWhiteOnly);
 
               // If it is possible to lock red, then check the high options, too
@@ -760,19 +849,20 @@ static void calculateWvec()
                 CHECK_W_AS_C1_THEN_C2_HI(YELLOW, RED, r)
                 CHECK_W_AS_C1_THEN_C2_HI(GREEN , RED, r)
                 CHECK_W_AS_C1_THEN_C2_HI(BLUE  , RED, r)
-                bestThruRed = pickBestAction(actionReward, 
+                bestThruRed = pickBestAction(actionReward,
                           HI_RED_ONLY, WHITE_AS_BLUE_THEN_HI_RED, bestThruRed);
               }
 
               for (y = 1; y <= 6; y++)
               {
+                // Evaluate all the options that just include the white dice and the yellow die
                 CHECK_LOW_C1_ONLY(YELLOW, y)
                 CHECK_W_AS_C1_THEN_C2_LOW(RED   , YELLOW, y)
                 CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, YELLOW, y)
                 CHECK_W_AS_C1_THEN_C2_LOW(GREEN , YELLOW, y)
                 CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , YELLOW, y)
 
-                int bestThruYellow = pickBestAction(actionReward, 
+                int bestThruYellow = pickBestAction(actionReward,
                             LOW_YELLOW_ONLY, WHITE_AS_BLUE_THEN_LOW_YELLOW, bestThruRed);
 
                 // If it is possible to lock yellow, then check the high options, too
@@ -783,19 +873,20 @@ static void calculateWvec()
                   CHECK_W_AS_C1_THEN_C2_HI(YELLOW, YELLOW, y)
                   CHECK_W_AS_C1_THEN_C2_HI(GREEN , YELLOW, y)
                   CHECK_W_AS_C1_THEN_C2_HI(BLUE  , YELLOW, y)
-                  bestThruYellow = pickBestAction(actionReward, 
+                  bestThruYellow = pickBestAction(actionReward,
                             HI_YELLOW_ONLY, WHITE_AS_BLUE_THEN_HI_YELLOW, bestThruYellow);
                 }
 
                 for (g = 1; g <= 6; g++)
                 {
+                  // Evaluate all the options that just include the white dice and the green die
                   CHECK_HI_C1_ONLY(GREEN, g)
                   CHECK_W_AS_C1_THEN_C2_HI(RED   , GREEN, g)
                   CHECK_W_AS_C1_THEN_C2_HI(YELLOW, GREEN, g)
                   CHECK_W_AS_C1_THEN_C2_HI(GREEN , GREEN, g)
                   CHECK_W_AS_C1_THEN_C2_HI(BLUE  , GREEN, g)
 
-                  int bestThruGreen = pickBestAction(actionReward, 
+                  int bestThruGreen = pickBestAction(actionReward,
                               HI_GREEN_ONLY, WHITE_AS_BLUE_THEN_HI_GREEN, bestThruYellow);
 
                   // If it is possible to lock green, then check the low green, too
@@ -806,19 +897,24 @@ static void calculateWvec()
                     CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, GREEN, g)
                     CHECK_W_AS_C1_THEN_C2_LOW(GREEN , GREEN, g)
                     CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , GREEN, g)
-                    bestThruGreen = pickBestAction(actionReward, 
+                    bestThruGreen = pickBestAction(actionReward,
                               LOW_GREEN_ONLY, WHITE_AS_BLUE_THEN_LOW_GREEN, bestThruGreen);
                   }
 
                   for (b = 1; b <= 6; b++)
                   {
+                    // Evaluate all the options that just include the white dice and the blue die
+
+                    // Note that since this is the inner-most loop, this is
+                    // where a vast majority of the program's time is spent.
                     CHECK_HI_C1_ONLY(BLUE, b)
                     CHECK_W_AS_C1_THEN_C2_HI(RED   , BLUE, b)
                     CHECK_W_AS_C1_THEN_C2_HI(YELLOW, BLUE, b)
                     CHECK_W_AS_C1_THEN_C2_HI(GREEN , BLUE, b)
                     CHECK_W_AS_C1_THEN_C2_HI(BLUE  , BLUE, b)
+                    // End of section where vast majority of the program's time is spent
 
-                    int bestThruBlue = pickBestAction(actionReward, 
+                    int bestThruBlue = pickBestAction(actionReward,
                                 HI_BLUE_ONLY, WHITE_AS_BLUE_THEN_HI_BLUE, bestThruGreen);
 
                     // If it is possible to lock blue, then check the low blue, too
@@ -829,7 +925,7 @@ static void calculateWvec()
                       CHECK_W_AS_C1_THEN_C2_LOW(YELLOW, BLUE, b)
                       CHECK_W_AS_C1_THEN_C2_LOW(GREEN , BLUE, b)
                       CHECK_W_AS_C1_THEN_C2_LOW(BLUE  , BLUE, b)
-                      bestThruBlue = pickBestAction(actionReward, 
+                      bestThruBlue = pickBestAction(actionReward,
                                 LOW_BLUE_ONLY, WHITE_AS_BLUE_THEN_LOW_BLUE, bestThruBlue);
                     }
 
@@ -840,7 +936,7 @@ static void calculateWvec()
                       printf("State %d [%d R:%d/%d Y:%d/%d G:%d/%d B:%d/%d], "
                              "Dice [W:%d %d R:%d Y:%d G:%d B:%d] Action %d Reward %.1f "
                              "Rewards: %.1f %.1f %.1f %.1f %.1f\n",
-                             s, p, 
+                             s, p,
                              state.color[0].numMarks, state.color[0].rightMark,
                              state.color[1].numMarks, state.color[1].rightMark,
                              state.color[2].numMarks, state.color[2].rightMark,
@@ -872,6 +968,7 @@ int main(int argc, char *argv[])
 {
     FILE *fp = NULL;
     char filenameBuf[128];
+    int num_iterations = -1; // -1 means do all of them
 
     initLookupTables();
 
@@ -883,7 +980,13 @@ int main(int argc, char *argv[])
       Wvec[i] = WVEC_END_OF_GAME;
     }
 
-    calculateWvec();
+    if (argc > 1)
+    {
+      num_iterations = atoi(argv[1]);
+      printf("Overriding num_iterations for all to %d. Presumably this is a short timing run?\n", num_iterations);
+    }
+
+    calculateWvec(num_iterations);
 
     snprintf(filenameBuf, sizeof(filenameBuf), "qwixx.bin");
     printf("Saving results to %s ...\n", filenameBuf);

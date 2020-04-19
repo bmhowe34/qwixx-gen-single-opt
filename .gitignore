@@ -2,3 +2,5 @@
 *.exe
 a.out
 qwixx.bin
+analysis.txt
+gmon.out
