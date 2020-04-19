@@ -1,16 +1,20 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <unistd.h>
 
+// The 4 Qwixx colors
 typedef enum {RED, YELLOW, GREEN, BLUE} QColor;
+
+#define NUM_COLORS 4
 
 typedef enum
 {
-  PENALTY,           // 0
+  PENALTY,                         // 0
 
-  WHITE_AS_RED,      // 1
+  WHITE_AS_RED,                    // 1
   WHITE_AS_YELLOW,
   WHITE_AS_GREEN,
   WHITE_AS_BLUE,
@@ -64,16 +68,59 @@ typedef enum
   WHITE_AS_GREEN_THEN_LOW_BLUE,
   WHITE_AS_BLUE_THEN_LOW_BLUE,
 
-  NUM_ACTIONS
+  NUM_ACTIONS                      // 45
 
 } QAction;
 
-#define NUM_COLORS               4
-#define NUM_SINGLE_COLOR_STATES 57
-#define NUM_DUAL_COLOR_STATES   (NUM_SINGLE_COLOR_STATES*(NUM_SINGLE_COLOR_STATES+1)/2) //    1653
-#define NUM_FOUR_COLOR_STATES   (NUM_DUAL_COLOR_STATES  *(NUM_DUAL_COLOR_STATES  +1)/2) // 1367031
-#define NUM_TOTAL_STATES        (NUM_FOUR_COLOR_STATES  * 4 + 1)                        // 5468125
+// As shown in Table 1 of:
+// https://drive.google.com/file/d/0B0E4VFlFjnCuME9sZGhrbGRIWXc/view
+// There are 62 states for each color. Using 1-based numbers, they are described below.
+// State   1    is  when the row is empty
+// State   2    is  when the there is a single mark, and it is in box "2"
+// States  3- 4 are when the last mark is in box "3", and there are 1-2 marks in the row, respectively
+// States  5- 7 are when the last mark is in box "4", and there are 1-3 marks in the row, respectively
+// States  8-11 are when the last mark is in box "5", and there are 1-4 marks in the row, respectively
+// States 12-16 are when the last mark is in box "6", and there are 1-5 marks in the row, respectively
+// ...
+// States 47-56 are when the last mark is in box "11", and there are 1-10 marks in the row, respectively
+// States 57-62 are when the last mark is in box "12", and there are 6-11 marks in the row, respectively
+//    Note: you can't mark box "12" until you have already taken 5 marks.
 
+// Given that there are 4 colors, and 5 possible penalty values (0, 1, 2, 3,
+// and 4), there are technically 62*62*62*62*5 = 73881680 "game" states.
+#define NUM_GAME_STATES (62*62*62*62*5)
+
+// Courtesy u/chaotic_iak:
+// While there are 62 states the row can be in, states 58-62 are all identical
+// to state 57, except they are offset by a constant number of points, so we
+// only need to actually track 57 states.
+#define NUM_SINGLE_COLOR_STATES 57
+
+// Courtesy u/chaotic_iak:
+// From a Markov probability perspective, red and yellow are essentially
+// equivalent.  That is - "3 red marks, last red 6; 4 yellow marks, last yellow
+// 9" is equivalent to "4 red marks, last red 9; 3 yellow marks, last yellow
+// 6". So treat them as the same Markov state. The same applies to green and
+// blue, respectively. Note that as a result, we are only populating the upper
+// triangular portion of c1c2ToCombined[][].
+#define NUM_DUAL_COLOR_STATES   (NUM_SINGLE_COLOR_STATES*(NUM_SINGLE_COLOR_STATES+1)/2) //    1653
+
+// Same logic as above, but it is for the *combination* of RY/GB.  We are only
+// populating the upper triangular portion of c12c34ToCombined[][].
+#define NUM_FOUR_COLOR_STATES   (NUM_DUAL_COLOR_STATES*(NUM_DUAL_COLOR_STATES+1)/2)     // 1367031
+
+// 4 possible penalty values before game ends (0, 1, 2, or 3). Add one state
+// for the end game state. This is the total number of states that we'll track
+// in the Markov matrix. Note that this is only ~7.4% of the total number of
+// "game" states.
+#define NUM_MARKOV_STATES       (NUM_FOUR_COLOR_STATES * 4 + 1)                         // 5468125
+
+// Set Wvec[] values for "end of game" states to invalid because you can't
+// actually count a score for these states (due to the 62-->57 state reduction
+// above).
+#define WVEC_END_OF_GAME (-1e100)
+
+// This is the state of a single color row on the Qwixx score sheet.
 typedef struct
 
 {
@@ -82,25 +129,44 @@ typedef struct
     int    rightMark; // 2-12
 } QColorState;
 
+// This is the state of the whole Qwixx score sheet
 typedef struct
 {
     QColorState color[NUM_COLORS];
     int numPenalties;
 } QwixxState;
 
+// This is the expected final score under optimal decisions for all possible states.
 static float *Wvec = NULL;
+
+// Combines 2 colors' [0-NUM_SINGLE_COLOR_STATES-1] states to the [0-NUM_DUAL_COLOR_STATES-1] range
 static int c1c2ToCombined[NUM_SINGLE_COLOR_STATES][NUM_SINGLE_COLOR_STATES];
-static int c12c24ToCombined[NUM_DUAL_COLOR_STATES][NUM_DUAL_COLOR_STATES];
+
+// Combines the red/yellow [0-NUM_DUAL_COLOR_STATES-1] with green/blue
+// [0-NUM_DUAL_COLOR_STATES-1] states to [0-NUM_FOUR_COLOR_STATES-1] range
+static int c12c34ToCombined[NUM_DUAL_COLOR_STATES][NUM_DUAL_COLOR_STATES];
+
+// Reverse lookup of c12c34ToCombined[][]
+// Maps [0-NUM_FOUR_COLOR_STATES-1] down to the [0-NUM_DUAL_COLOR_STATES-1] range; picked such that c12 <= c34
 static int quadToC12[NUM_FOUR_COLOR_STATES];
 static int quadToC34[NUM_FOUR_COLOR_STATES];
+
+// Reverse lookup of c1c2ToCombined[][]
+// Maps [0-NUM_DUAL_COLOR_STATES-1] down to the [0-NUM_SINGLE_COLOR_STATES-1] range; picked such that c1 <= c2
 static int dualToC1 [NUM_DUAL_COLOR_STATES];
 static int dualToC2 [NUM_DUAL_COLOR_STATES];
 
-static inline float getWforState(QwixxState *state);
-static inline int colorStateTo62State(QColorState *color);
+// Function prototypes
+static inline float getWforState       (QwixxState  *state);
+static inline int   colorStateTo62State(QColorState *color);
 
+// Returns 1 if it is legal to take a move; 0 otherwise Also returns the W
+// value for that new state. Note that this function is called A LOT.
 inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalties, int colorStates[], 
-                int *newStateIx, int newColorStates[], float *newStateW)
+                // Outputs
+                int   *newStateIx,       // 0-NUM_GAME_STATES-1
+                int    newColorStates[], // The state of each color, [0-61]
+                float *newStateW)        // The expected score corresponding to *newStateIx
 {
     int retVal = 0;
 
@@ -122,7 +188,6 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
         //printf("Calling getWState for color %d diceVal %d\n", color, diceVal);
         *newStateW = getWforState(&newQstate);
 
-        // FIXME - maybe not needed anymore??
         int newColorState = colorStateTo62State(&newQstate.color[color]);
         newColorStates[0] = colorStates[0];
         newColorStates[1] = colorStates[1];
@@ -139,6 +204,7 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
     return retVal;
 }
 
+// Update a QColorState's 'rightMark' and 'numMarks' corresponding to input ix (ix range: 0-61)
 void colorIx2State(int ix, QColorState *color)
 {
   if (ix == 0)
@@ -201,6 +267,9 @@ void colorIx2State(int ix, QColorState *color)
     color->rightMark = 12;       // locked
     color->numMarks  = ix - 55 + 5;
   }
+
+  // Red and yellow count up and are handled correctly above.  If this is green
+  // or blue, then they count down. Adjust rightMark accordingly.
   if (color->color == GREEN || color->color == BLUE)
   {
     if (color->rightMark > 0)
@@ -210,6 +279,7 @@ void colorIx2State(int ix, QColorState *color)
   }
 }
 
+// Construct QwixxState from a state index (range 0-NUM_GAME_STATES-1
 void constructStateFromIx(int ix, QwixxState *state)
 {
   state->numPenalties = ix / (62*62*62*62);
@@ -225,6 +295,7 @@ void constructStateFromIx(int ix, QwixxState *state)
   colorIx2State(blueIx  , &state->color[BLUE  ]);
 }
 
+// Convert a QColorState to a state index (0-61)
 static inline int colorStateTo62State(QColorState *color)
 {
   static const int lookupTbl[13][12] =
@@ -259,7 +330,7 @@ static inline int colorStateTo62State(QColorState *color)
 
 static void initLookupTables()
 {
-  // Form c1c2ToCombined
+  // Form c1c2ToCombined and c12c34ToCombined
   int c1, c2, c12, c34, c1234;
 
   memset(c1c2ToCombined, 0, sizeof(c1c2ToCombined));
@@ -277,7 +348,7 @@ static void initLookupTables()
     }
   }
 
-  memset(c12c24ToCombined, 0, sizeof(c12c24ToCombined));
+  memset(c12c34ToCombined, 0, sizeof(c12c34ToCombined));
   memset(quadToC12,        0, sizeof(quadToC12));
   memset(quadToC34,        0, sizeof(quadToC34));
   c1234 = 0;
@@ -285,7 +356,7 @@ static void initLookupTables()
   {
     for (c34 = c12; c34 < NUM_DUAL_COLOR_STATES; c34++)
     {
-      c12c24ToCombined[c12][c34] = c1234;
+      c12c34ToCombined[c12][c34] = c1234;
       quadToC12[c1234]           = c12;
       quadToC34[c1234]           = c34;
       c1234++;
@@ -293,6 +364,7 @@ static void initLookupTables()
   }
 }
 
+// Convert ALREADY CLIPPED values to a state index (output range 0..NUM_MARKOV_STATES-1)
 static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx, int blueIx, int numPenalties)
 {
   int retVal = 0;
@@ -301,7 +373,7 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
 
   if (numPenalties >= 4)
   {
-    retVal = NUM_TOTAL_STATES - 1;
+    retVal = NUM_MARKOV_STATES - 1;
   }
   else
   {
@@ -332,46 +404,13 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
       ry  = tmp;
     }
 
-    rygb = c12c24ToCombined[ry][gb];
+    rygb = c12c34ToCombined[ry][gb];
 
     //printf("convert5tupleToIx(%d,%d,%d,%d,%d) --> ry %d, gb %d, rygb %d\n",
     //   redIx, yellowIx, greenIx, blueIx, numPenalties, ry, gb, rygb);
 
     retVal = numPenalties * NUM_FOUR_COLOR_STATES + rygb;
   }
-
-  return retVal;
-}
-
-static inline int convert5tupleToIx(int redIx, int yellowIx, int greenIx, int blueIx, int numPenalties)
-{
-  int retVal = 0;
-
-  //Clip to be <= 56
-  int new_redIx    = (redIx   <=56) ? redIx    : 56;
-  int new_yellowIx = (yellowIx<=56) ? yellowIx : 56;
-  int new_greenIx  = (greenIx <=56) ? greenIx  : 56;
-  int new_blueIx   = (blueIx  <=56) ? blueIx   : 56;
-
-  retVal = convertClipped5tupleToIx(new_redIx, new_yellowIx, new_greenIx, new_blueIx, numPenalties);
-
-  return retVal;
-}
-
-static inline int convertRYGBPToIx(int RYGB[], int numPenalties)
-{
-  return convert5tupleToIx(RYGB[0], RYGB[1], RYGB[2], RYGB[3], numPenalties);
-}
-
-static inline int convertStateToIx(QwixxState *state)
-{
-  int retVal = 0;
-  int redIx    = colorStateTo62State(&state->color[RED   ]);
-  int yellowIx = colorStateTo62State(&state->color[YELLOW]);
-  int greenIx  = colorStateTo62State(&state->color[GREEN ]);
-  int blueIx   = colorStateTo62State(&state->color[BLUE  ]);
-
-  retVal = convert5tupleToIx(redIx, yellowIx, greenIx, blueIx, state->numPenalties);
 
   return retVal;
 }
@@ -401,6 +440,7 @@ int isGameOver(QwixxState *state)
 
 int getColorScore(QColorState *color)
 {
+  // Index by number of marks. Add 1 for "lock" bonus
   int scores[] = {0,1,3,6,10,15,21,28,36,45,55,66,78};
   int isLocked = 0;
   if (color->color == RED || color->color == YELLOW)
@@ -419,6 +459,7 @@ int getScore(QwixxState *state)
 {
   int score = 0;
 
+  // -5 points per penalty
   score -= 5 * state->numPenalties;
   score += getColorScore(&state->color[RED   ]);
   score += getColorScore(&state->color[YELLOW]);
@@ -428,22 +469,28 @@ int getScore(QwixxState *state)
   return score;
 }
 
+// Prior to the state reduction optimization, this function was a trival
+// conversion from QwixxState to an index, followed by a lookup into Wvec[]
+// with the new index.  However, it is a bit more complicated now that we have
+// reduced from NUM_GAME_STATES down to NUM_MARKOV_STATES states.
 static float getWforState(QwixxState *state)
 {
-  float retVal = 0.0;
-  int ix = 0;
+  float retVal     = 0.0;
+  int ix           = 0;
 
-  int redIx    = 0;
-  int yellowIx = 0;
-  int greenIx  = 0;
-  int blueIx   = 0;
-  int rClipped = 0;
-  int yClipped = 0;
-  int gClipped = 0;
-  int bClipped = 0;
-  int warning  = 0;
+  int redIx        = 0;
+  int yellowIx     = 0;
+  int greenIx      = 0;
+  int blueIx       = 0;
+  int rClipped     = 0;
+  int yClipped     = 0;
+  int gClipped     = 0;
+  int bClipped     = 0;
+  int warning      = 0;
   int valIsClipped = 0;
 
+  // Wvec[] is invalid for a "game over" state since a single "game over" state
+  // can correspond to many actual scores.
   if (isGameOver(state))
   {
     retVal = (float) getScore(state);
@@ -455,42 +502,24 @@ static float getWforState(QwixxState *state)
     greenIx  = colorStateTo62State(&state->color[GREEN ]);
     blueIx   = colorStateTo62State(&state->color[BLUE  ]);
 
-    if (redIx > 56)
-    {
-      rClipped     = 56;
-      valIsClipped = 1;
+#define CLIP_CHECK(colorIx, cClipped, valIsClipped)    \
+    if (colorIx > 56)                                  \
+    {                                                  \
+      cClipped     = 56;                               \
+      valIsClipped = 1;                                \
+    }                                                  \
+    else                                               \
+    {                                                  \
+      cClipped = colorIx;                              \
     }
-    else
-    {
-      rClipped = redIx;
-    }
-    if (yellowIx > 56)
-    {
-      yClipped     = 56;
-      valIsClipped = 1;
-    }
-    else
-    {
-      yClipped = yellowIx;
-    }
-    if (greenIx > 56)
-    {
-      gClipped     = 56;
-      valIsClipped = 1;
-    }
-    else
-    {
-      gClipped = greenIx;
-    }
-    if (blueIx > 56)
-    {
-      bClipped     = 56;
-      valIsClipped = 1;
-    }
-    else
-    {
-      bClipped = blueIx;
-    }
+
+    CLIP_CHECK(redIx,    rClipped, valIsClipped)
+    CLIP_CHECK(yellowIx, yClipped, valIsClipped)
+    CLIP_CHECK(greenIx,  gClipped, valIsClipped)
+    CLIP_CHECK(blueIx,   bClipped, valIsClipped)
+
+    // The following array helps account that state 56 is equivalent to states
+    // 57-61, except for the number of points that has been earned by the state.
 
     // 62stateIx =                  57,   58,   59,   60,   61
     static const float offset[] = {8.0, 17.0, 27.0, 38.0, 50.0};
@@ -498,7 +527,7 @@ static float getWforState(QwixxState *state)
     ix = convertClipped5tupleToIx(rClipped, yClipped, gClipped, bClipped, state->numPenalties);
 
     retVal = Wvec[ix];
-    if (retVal == -1e15f)
+    if (retVal == WVEC_END_OF_GAME)
     {
       printf("WARNING!\n");
       warning = 1;
@@ -524,16 +553,18 @@ static float getWforState(QwixxState *state)
            state->color[2].numMarks, state->color[2].rightMark, greenIx,
            state->color[3].numMarks, state->color[3].rightMark, blueIx,
            retVal);
+    exit(-1);
   }
 
   return retVal;
 }
 
+// Pick the best action out of the iStart...iStop possibilities
 inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBeforeStart)
 {
-  int bestIdx = iBestBeforeStart;
+  int    bestIdx    = iBestBeforeStart;
   double bestReward = rewards[iBestBeforeStart];
-  int loopIdx;
+  int    loopIdx;
 
   for (loopIdx = iStart; loopIdx <= iStop; loopIdx++)
   {
@@ -547,11 +578,14 @@ inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBefo
   return bestIdx;
 }
 
-static void *calculateWvec(void *parms)
+// This is the main function that calculates the W vector. It takes a very long time.
+static void calculateWvec()
 {
-  int p = 0;
-  int s = 0;
-  int RYGB[4] = {0};
+  int          p                = 0;  // shortcut for number of penalties
+  int          s                = 0;  // state loop index
+  int          RYGB[NUM_COLORS] = {0};
+
+  // Probability of each 6-dice throw (each die has 6 possible outcomes)
   const double inv6_to6 = 1.0 / (6*6*6*6*6*6);
 
   QwixxState state;
@@ -561,13 +595,17 @@ static void *calculateWvec(void *parms)
   state.color[GREEN ].color = GREEN;
   state.color[BLUE  ].color = BLUE;
 
-  for (s = NUM_TOTAL_STATES - 1; s >= 0; s--)
+  // Loop through the states backwards. Each loop only looks at state indices
+  // >= this current s, so it only works when looping backward.
+  for (s = NUM_MARKOV_STATES - 1; s >= 0; s--)
   {
     int numPenalties = s / NUM_FOUR_COLOR_STATES; // integer division
     int rygbState    = s % NUM_FOUR_COLOR_STATES;
     if (numPenalties >= 4)
     {
-      Wvec[s] = -1e100;
+      // Set Wvec[s] to invalid because you can't actually count a score for
+      // "end of game" Wvec states.
+      Wvec[s] = WVEC_END_OF_GAME;
     }
     else
     {
@@ -590,11 +628,13 @@ static void *calculateWvec(void *parms)
 
       if (isGameOver(&state))
       {
-        Wvec[s] = -1e100;
+        // Set Wvec[s] to invalid because you can't actually count a score for
+        // "end of game" Wvec states.
+        Wvec[s] = WVEC_END_OF_GAME;
       }
       else
       {
-        // Roll the dice
+        // Roll the dice (two white dice, red, yellow, green, blue)
         int w1, w2, r, y, g, b;
         double   actionReward[NUM_ACTIONS];
         int    newColorStates[NUM_COLORS];
@@ -614,15 +654,13 @@ static void *calculateWvec(void *parms)
         int        canTakeWasGREEN  = 0;
         int        canTakeWasBLUE   = 0;
 
-        {
-          QwixxState stateWithAddtlPenalty = state;
-          stateWithAddtlPenalty.numPenalties++;
-          actionReward[PENALTY] = getWforState(&stateWithAddtlPenalty);
-        }
+        QwixxState stateWithAddtlPenalty = state;
+        stateWithAddtlPenalty.numPenalties++;
+        actionReward[PENALTY] = getWforState(&stateWithAddtlPenalty);
 
         for (w1 = 1; w1 <= 6; w1++)
         {
-          // w2 is always >= w1
+          // Optimization: w2 is always >= w1
           for (w2 = w1; w2 <= 6; w2++)
           {
             int w = w1 + w2;
@@ -823,9 +861,9 @@ static void *calculateWvec(void *parms)
         Wvec[s] = theWnext;
       } // end else game not over
     } // end else numPenalties < 4
-    if ((NUM_TOTAL_STATES - s) % 1000 == 0)
+    if ((NUM_MARKOV_STATES - s) % 1000 == 0)
     {
-      printf("% 8d / % 8d states complete\n", NUM_TOTAL_STATES - s, NUM_TOTAL_STATES);
+      printf("% 8d / % 8d states complete\n", NUM_MARKOV_STATES - s, NUM_MARKOV_STATES);
     }
   } // end s loop
 } // end calculateWvec()
@@ -837,23 +875,26 @@ int main(int argc, char *argv[])
 
     initLookupTables();
 
-    Wvec = malloc(sizeof(float)*NUM_TOTAL_STATES);
+    Wvec = malloc(sizeof(float)*NUM_MARKOV_STATES);
     int i;
-    for (i = 0; i < NUM_TOTAL_STATES; i++)
+    for (i = 0; i < NUM_MARKOV_STATES; i++)
     {
-      Wvec[i] = -1e15f;
+      // Initialize to "end of game" values
+      Wvec[i] = WVEC_END_OF_GAME;
     }
 
-    calculateWvec(NULL);
+    calculateWvec();
 
     snprintf(filenameBuf, sizeof(filenameBuf), "qwixx.bin");
     printf("Saving results to %s ...\n", filenameBuf);
     fp = fopen(filenameBuf,"wb");
     if (fp)
     {
-      fwrite(Wvec, sizeof(float)*NUM_TOTAL_STATES, 1, fp);
+      fwrite(Wvec, sizeof(float)*NUM_MARKOV_STATES, 1, fp);
       fclose(fp);
     }
+
+    printf("Wvec[0] = %.2f\n", Wvec[0]);
 
     return 0;
 }
