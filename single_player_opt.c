@@ -49,7 +49,8 @@ typedef enum
   // would normally never choose HI_RED_ONLY because that just *takes away*
   // from future possible points. However, when the higher sum (w2+red) would
   // lock the red row, that is worthy of being considered every time it is
-  // possible, as that may be the best choice.
+  // possible, as that may be the best choice, as it may end the game and
+  // prevent future penalties.
   HI_RED_ONLY,                     // 25
   WHITE_AS_RED_THEN_HI_RED,
   WHITE_AS_YELLOW_THEN_HI_RED,
@@ -307,7 +308,7 @@ void colorIx2State(int ix, QColorState *color)
   }
 }
 
-// Construct QwixxState from a state index (range 0-NUM_GAME_STATES-1
+// Construct QwixxState from a state index (range 0-NUM_GAME_STATES-1)
 void constructStateFromIx(int ix, QwixxState *state)
 {
   state->numPenalties = ix / (62*62*62*62);
