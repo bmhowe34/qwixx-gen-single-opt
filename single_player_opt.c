@@ -164,11 +164,29 @@ static int dualToC1 [NUM_DUAL_COLOR_STATES];
 static int dualToC2 [NUM_DUAL_COLOR_STATES];
 
 // Function prototypes
-static inline float getWforState       (QwixxState  *state);
-static inline float getWforStateOpt    (QwixxState  *state, int r62ix, int y62ix, int g62ix, int b62ix);
+static inline float getWforState       (QwixxState  *state, int *markovIx);
+static inline float getWforStateOpt    (QwixxState  *state, int r62ix, int y62ix, int g62ix, int b62ix, int *markovIx);
 static inline int   colorStateTo62State(QColorState *color);
 
 static inline int getScore(QwixxState *state);
+
+// Macro to swap two integers
+#define SWAP_INT(a,b) \
+do                    \
+{                     \
+  int tmp = a;        \
+  a = b;              \
+  b = tmp;            \
+} while (0)
+
+void initialize_qwixx_state(QwixxState *state)
+{
+  memset(state, 0, sizeof(*state));
+  state->color[RED   ].color = RED;
+  state->color[YELLOW].color = YELLOW;
+  state->color[GREEN ].color = GREEN;
+  state->color[BLUE  ].color = BLUE;
+}
 
 // Returns 1 if it is legal to take a move; 0 otherwise Also returns the W
 // value for that new state. Note that this function is called A LOT.
@@ -220,7 +238,8 @@ inline int canTakeMark(QwixxState *state, int color, int diceVal, int numPenalti
                                        newColorStates[0],
                                        newColorStates[1],
                                        newColorStates[2],
-                                       newColorStates[3]);
+                                       newColorStates[3],
+                                       NULL); // don't save markov state index output
         }
 
         *newStateIx = numPenalties           * 62*62*62*62 +
@@ -398,7 +417,7 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
 {
   int retVal = 0;
 
-  int ry, gb, rygb, tmp;
+  int ry, gb, rygb;
 
   if (numPenalties >= 4)
   {
@@ -409,17 +428,13 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
     // Force redIx <= yellowIx
     if (redIx > yellowIx)
     {
-      tmp      = redIx;
-      redIx    = yellowIx;
-      yellowIx = tmp;
+      SWAP_INT(redIx, yellowIx);
     }
 
     // Force greenIx <= blueIx
     if (greenIx > blueIx)
     {
-      tmp     = greenIx;
-      greenIx = blueIx;
-      blueIx  = tmp;
+      SWAP_INT(greenIx, blueIx);
     }
 
     ry = c1c2ToCombined[  redIx][yellowIx];
@@ -428,9 +443,7 @@ static inline int convertClipped5tupleToIx(int redIx, int yellowIx, int greenIx,
     // Force ry <= gb
     if (ry > gb)
     {
-      tmp = gb;
-      gb  = ry;
-      ry  = tmp;
+      SWAP_INT(ry, gb);
     }
 
     rygb = c12c34ToCombined[ry][gb];
@@ -502,7 +515,7 @@ static inline int getScore(QwixxState *state)
 // must be met before using this optimized version of the function.
 // 1. The "62 index" values must be consistent with the "state" parameter.
 // 2. The state must not correspond to a "game over" state
-static inline float getWforStateOpt(QwixxState *state, int r62ix, int y62ix, int g62ix, int b62ix)
+static inline float getWforStateOpt(QwixxState *state, int r62ix, int y62ix, int g62ix, int b62ix, int *markovIx)
 {
   float retVal     = 0.0;
   int ix           = 0;
@@ -574,7 +587,7 @@ static inline float getWforStateOpt(QwixxState *state, int r62ix, int y62ix, int
 // conversion from QwixxState to an index, followed by a lookup into Wvec[]
 // with the new index.  However, it is a bit more complicated now that we have
 // reduced from NUM_GAME_STATES down to NUM_MARKOV_STATES states.
-static float getWforState(QwixxState *state)
+static float getWforState(QwixxState *state, int *markovIx)
 {
   float retVal     = 0.0;
   int   redIx      = 0;
@@ -587,6 +600,10 @@ static float getWforState(QwixxState *state)
   if (isGameOver(state))
   {
     retVal = (float) getScore(state);
+    if (markovIx)
+    {
+      *markovIx = NUM_MARKOV_STATES - 1;
+    }
   }
   else
   {
@@ -595,7 +612,7 @@ static float getWforState(QwixxState *state)
     greenIx  = colorStateTo62State(&state->color[GREEN ]);
     blueIx   = colorStateTo62State(&state->color[BLUE  ]);
 
-    retVal   = getWforStateOpt(state, redIx, yellowIx, greenIx, blueIx);
+    retVal   = getWforStateOpt(state, redIx, yellowIx, greenIx, blueIx, markovIx);
   }
 
   return retVal;
@@ -621,39 +638,88 @@ inline int pickBestAction(double rewards[], int iStart, int iStop, int iBestBefo
 }
 
 // This is the main function that calculates the W vector. It takes a very long time.
-static void calculateWvec(int num_iterations)
+// NOTE:
+//
+// If pState is NULL, this loops over all states to populate the W vector. In
+// this case, the dice roll values are ignored.
+//
+// If pState is non-NULL, the dice rolls are used to calculate the optimal move
+// according to W vector. pState is updated to the optimal selection.
+static void analyzeState(QwixxState *pState,
+                         int num_iterations,
+                         int w1_roll, int w2_roll, int r_roll, int y_roll, int g_roll, int b_roll,
+                         int print_actions)
 {
   int          p                = 0;  // shortcut for number of penalties
-  int          s                = 0;  // state loop index
+  int          s                = 0;  // markov state loop index
   int          RYGB[NUM_COLORS] = {0};
+  int          game_state       = 0;
+
+  int s1 = 0; // Looping indices (start index)
+  int s2 = 0; //                 (stop  index)
+
+  int do_one_state = (pState != NULL);
 
   // Probability of each 6-dice throw (each die has 6 possible outcomes)
   const double inv6_to6 = 1.0 / (6*6*6*6*6*6);
 
-  // Allow the main loop to be cut short for timing purposes
-  int stopping_state_index = 0;
-  if (num_iterations > 0)
-  {
-    stopping_state_index = NUM_MARKOV_STATES - num_iterations;
-    if (stopping_state_index < 0)
-    {
-      stopping_state_index = 0;
-    }
-  }
-
   QwixxState state;
   memset(&state, 0, sizeof(state));
-  state.color[RED   ].color = RED;
-  state.color[YELLOW].color = YELLOW;
-  state.color[GREEN ].color = GREEN;
-  state.color[BLUE  ].color = BLUE;
+
+  if (pState == NULL)
+  {
+    initialize_qwixx_state(&state);
+
+    s1 = NUM_MARKOV_STATES - 1;
+    s2 = 0;
+
+    // Allow the main loop to be cut short if num_iterations is > 0
+    if (num_iterations > 0)
+    {
+      s2 = NUM_MARKOV_STATES - num_iterations;
+      if (s2 < 0)
+      {
+        s2 = 0;
+      }
+    }
+  }
+  else
+  {
+    // Only run through the loop once. Fetch appropriate Markov state index for
+    // loop bounds.
+    getWforState(pState, &s1);
+    s2 = s1;
+
+#define CHECK_RANGE(d)                                                         \
+    if (d < 1 || d > 6)                                                        \
+    {                                                                          \
+      printf("Invalid dice value passed to analyzeState (%d)! Exiting!\n", d); \
+      exit(-1);                                                                \
+    }
+    CHECK_RANGE(w1_roll);
+    CHECK_RANGE(w2_roll);
+    CHECK_RANGE(r_roll);
+    CHECK_RANGE(y_roll);
+    CHECK_RANGE(g_roll);
+    CHECK_RANGE(b_roll);
+  }
 
   // Loop through the states backwards. Each loop only looks at state indices
   // >= this current s, so it only works when looping backward.
-  for (s = NUM_MARKOV_STATES - 1; s >= stopping_state_index; s--)
+  for (s = s1; s >= s2; s--)
   {
     int numPenalties = s / NUM_FOUR_COLOR_STATES; // integer division
     int rygbState    = s % NUM_FOUR_COLOR_STATES;
+
+    if (do_one_state)
+    {
+      if (isGameOver(pState))
+      {
+        printf("Cannot analyze this state because the game is over.\n");
+        break;
+      }
+    }
+
     if (numPenalties >= 4)
     {
       // Set Wvec[s] to invalid because you can't actually count a score for
@@ -676,6 +742,29 @@ static void calculateWvec(int num_iterations)
       colorIx2State(RYGB[2], &state.color[GREEN ]);
       colorIx2State(RYGB[3], &state.color[BLUE  ]);
 
+      if (do_one_state)
+      {
+        // Override state with pState contents
+        memcpy(&state, pState, sizeof(state));
+
+        // In the do_one_state version, these are the 0-61 state indices while
+        // in the multi-state version of this function they are the 0-56
+        // states. The functions called by this function support both types of
+        // states.
+        RYGB[0] = colorStateTo62State(&state.color[RED   ]);
+        RYGB[1] = colorStateTo62State(&state.color[YELLOW]);
+        RYGB[2] = colorStateTo62State(&state.color[GREEN ]);
+        RYGB[3] = colorStateTo62State(&state.color[BLUE  ]);
+        numPenalties = state.numPenalties;
+
+        // Calculate state in range 0...NUM_GAME_STATES-1
+        game_state = numPenalties * 62*62*62*62 +
+                     RYGB[0]      * 62*62*62    +
+                     RYGB[1]      * 62*62       +
+                     RYGB[2]      * 62          +
+                     RYGB[3];
+      }
+
       // Shortcut for number of penalties
       p = numPenalties;
 
@@ -690,6 +779,7 @@ static void calculateWvec(int num_iterations)
         // Roll the dice (two white dice, red, yellow, green, blue)
         int w1, w2, r, y, g, b;
         double   actionReward[NUM_ACTIONS];
+        int    stateForAction[NUM_ACTIONS];
         int    newColorStates[NUM_COLORS];
         double theWnext = 0.0;
 
@@ -706,21 +796,46 @@ static void calculateWvec(int num_iterations)
         int        canTakeWasYELLOW = 0;
         int        canTakeWasGREEN  = 0;
         int        canTakeWasBLUE   = 0;
+        int        bestChoice       = 0;
+
+        memset(stateForAction, 0, sizeof(stateForAction));
+
+        // Use a macro to create w1_min, w1_max, ..., b_min, b_max
+#define DECLARE_LOOP_MIN_MAX(COLOR)                           \
+        int COLOR##_min = (do_one_state) ? COLOR##_roll : 1;  \
+        int COLOR##_max = (do_one_state) ? COLOR##_roll : 6;
+        DECLARE_LOOP_MIN_MAX(w1)
+        DECLARE_LOOP_MIN_MAX(w2)
+        DECLARE_LOOP_MIN_MAX(r)
+        DECLARE_LOOP_MIN_MAX(y)
+        DECLARE_LOOP_MIN_MAX(g)
+        DECLARE_LOOP_MIN_MAX(b)
 
         QwixxState stateWithAddtlPenalty = state;
         stateWithAddtlPenalty.numPenalties++;
-        actionReward[PENALTY] = getWforState(&stateWithAddtlPenalty);
+        actionReward  [PENALTY] = getWforState(&stateWithAddtlPenalty, NULL);
+        stateForAction[PENALTY] = game_state + 62*62*62*62;
 
-        for (w1 = 1; w1 <= 6; w1++)
+        for (w1 = w1_min; w1 <= w1_max; w1++)
         {
-          // Optimization: w2 is always >= w1
-          for (w2 = w1; w2 <= 6; w2++)
+          // Optimization: w2 is always >= w1 (when doing multiple states)
+          if (do_one_state == 0)
+          {
+            w2_min = w1;
+          }
+
+          for (w2 = w2_min; w2 <= w2_max; w2++)
           {
             int w = w1 + w2;
             // count some cases twice due to w2 looping limits optimizations
             double pScale = (w1 == w2) ? inv6_to6 : (2*inv6_to6);
             int newStateIx = 0;
             float newStateW = 0.0f;
+
+            if (do_one_state)
+            {
+              pScale = 1.0; // only evaluating 1 possible dice throw combination
+            }
 
 // This macro checks to see if you can take the sum of the two white dice as
 // one of the colors. This is the first choice a Qwixx player must evaluate.
@@ -729,7 +844,8 @@ static void calculateWvec(int num_iterations)
             canTakeWas##COLORUPPER = 0;                                                                                         \
             if (canTakeMark(&state, COLORUPPER, w, p, RYGB, &newStateIx, newTmpColStateTookWas##COLORUPPER, &newStateW))        \
             {                                                                                                                   \
-              actionReward[WHITE_AS_##COLORUPPER] = newStateW;                                                                  \
+              actionReward  [WHITE_AS_##COLORUPPER] = newStateW;                                                                \
+              stateForAction[WHITE_AS_##COLORUPPER] = newStateIx;                                                               \
               newTmpStateTookWas##COLORUPPER = state;                                                                           \
               colorIx2State(newTmpColStateTookWas##COLORUPPER[COLORUPPER], &newTmpStateTookWas##COLORUPPER.color[COLORUPPER]);  \
               canTakeWas##COLORUPPER = ! isGameOver(&newTmpStateTookWas##COLORUPPER);                                           \
@@ -743,7 +859,7 @@ static void calculateWvec(int num_iterations)
             // Evaluate the best option that has been calculated so far
             int bestThruWhiteOnly = pickBestAction(actionReward, WHITE_AS_RED, WHITE_AS_BLUE, PENALTY);
 
-            for (r = 1; r <= 6; r++)
+            for (r = r_min; r <= r_max; r++)
             {
 // CHECK_LOW_C1_ONLY:
 // This macro checks to see if you can take the lower of (w1,w2) (which is
@@ -758,11 +874,13 @@ static void calculateWvec(int num_iterations)
               actionReward[LOW_##COLOR1UPPER##_ONLY] = -1e9;                                                                 \
               if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
               {                                                                                                              \
-                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                          \
+                actionReward  [LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                        \
+                stateForAction[LOW_##COLOR1UPPER##_ONLY] = newStateIx;                                                       \
               }                                                                                                              \
               else if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
               {                                                                                                              \
-                actionReward[LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                          \
+                actionReward  [LOW_##COLOR1UPPER##_ONLY] = newStateW;                                                        \
+                stateForAction[LOW_##COLOR1UPPER##_ONLY] = newStateIx;                                                       \
               }
 
 // CHECK_HI_C1_ONLY:
@@ -776,11 +894,13 @@ static void calculateWvec(int num_iterations)
               actionReward[HI_##COLOR1UPPER##_ONLY] = -1e9;                                                                  \
               if (canTakeMark(&state, COLOR1UPPER, w2+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))       \
               {                                                                                                              \
-                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                                           \
+                actionReward  [HI_##COLOR1UPPER##_ONLY] = newStateW;                                                         \
+                stateForAction[HI_##COLOR1UPPER##_ONLY] = newStateIx;                                                        \
               }                                                                                                              \
               else if (canTakeMark(&state, COLOR1UPPER, w1+colorDiceVal, p, RYGB, &newStateIx, newColorStates, &newStateW))  \
               {                                                                                                              \
-                actionReward[HI_##COLOR1UPPER##_ONLY] = newStateW;                                                           \
+                actionReward  [HI_##COLOR1UPPER##_ONLY] = newStateW;                                                         \
+                stateForAction[HI_##COLOR1UPPER##_ONLY] = newStateIx;                                                        \
               }
 
 // CHECK_W_AS_C1_THEN_C2_LOW:
@@ -800,12 +920,14 @@ static void calculateWvec(int num_iterations)
                 if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,                           \
                     newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
                 {                                                                                                            \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                                 \
+                  actionReward  [WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                               \
+                  stateForAction[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateIx;                              \
                 }                                                                                                            \
                 else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,                      \
                     newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
                 {                                                                                                            \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                                 \
+                  actionReward  [WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateW;                               \
+                  stateForAction[WHITE_AS_##COLOR1UPPER##_THEN_LOW_##COLOR2UPPER] = newStateIx;                              \
                 }                                                                                                            \
               }
 
@@ -823,12 +945,14 @@ static void calculateWvec(int num_iterations)
                 if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w2+colorDiceVal, p,                           \
                     newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
                 {                                                                                                            \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                  \
+                  actionReward  [WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                \
+                  stateForAction[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateIx;                               \
                 }                                                                                                            \
                 else if (canTakeMark(&newTmpStateTookWas##COLOR1UPPER, COLOR2UPPER, w1+colorDiceVal, p,                      \
                     newTmpColStateTookWas##COLOR1UPPER, &newStateIx, newColorStates, &newStateW))                            \
                 {                                                                                                            \
-                  actionReward[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                  \
+                  actionReward  [WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateW;                                \
+                  stateForAction[WHITE_AS_##COLOR1UPPER##_THEN_HI_##COLOR2UPPER] = newStateIx;                               \
                 }                                                                                                            \
               }
 
@@ -854,7 +978,7 @@ static void calculateWvec(int num_iterations)
                           HI_RED_ONLY, WHITE_AS_BLUE_THEN_HI_RED, bestThruRed);
               }
 
-              for (y = 1; y <= 6; y++)
+              for (y = y_min; y <= y_max; y++)
               {
                 // Evaluate all the options that just include the white dice and the yellow die
                 CHECK_LOW_C1_ONLY(YELLOW, y)
@@ -878,7 +1002,7 @@ static void calculateWvec(int num_iterations)
                             HI_YELLOW_ONLY, WHITE_AS_BLUE_THEN_HI_YELLOW, bestThruYellow);
                 }
 
-                for (g = 1; g <= 6; g++)
+                for (g = g_min; g <= g_max; g++)
                 {
                   // Evaluate all the options that just include the white dice and the green die
                   CHECK_HI_C1_ONLY(GREEN, g)
@@ -902,7 +1026,7 @@ static void calculateWvec(int num_iterations)
                               LOW_GREEN_ONLY, WHITE_AS_BLUE_THEN_LOW_GREEN, bestThruGreen);
                   }
 
-                  for (b = 1; b <= 6; b++)
+                  for (b = b_min; b <= b_max; b++)
                   {
                     // Evaluate all the options that just include the white dice and the blue die
 
@@ -932,6 +1056,8 @@ static void calculateWvec(int num_iterations)
 
                     theWnext += actionReward[bestThruBlue] * pScale;
 
+                    bestChoice = bestThruBlue;
+
                     if (0)//actionReward[bestThruBlue] > 0.0 && bestThruBlue != PENALTY)
                     {
                       printf("State %d [%d R:%d/%d Y:%d/%d G:%d/%d B:%d/%d], "
@@ -955,24 +1081,113 @@ static void calculateWvec(int num_iterations)
             } // r
           } // w2
         } // w1
-        Wvec[s] = theWnext;
+
+        if ( do_one_state )
+        {
+          // Update the state according to the best choice
+          constructStateFromIx(stateForAction[bestChoice], pState);
+
+          if ( print_actions )
+          {
+            printf("Before the dice, your expected score was %.3f\n", getWforState(&state, NULL));
+            printf("After  the dice, your expected score is  %.3f, if you take choice %d\n",
+                          actionReward[bestChoice], bestChoice);
+            printf("Here are the expected scores for all choices:\n");
+            printf("  00 - PENALTY:                          %.3f\n", actionReward[ 0]);
+            printf("  01 - WHITE_AS_RED:                     %.3f\n", actionReward[ 1]);
+            printf("  02 - WHITE_AS_YELLOW:                  %.3f\n", actionReward[ 2]);
+            printf("  03 - WHITE_AS_GREEN:                   %.3f\n", actionReward[ 3]);
+            printf("  04 - WHITE_AS_BLUE:                    %.3f\n", actionReward[ 4]);
+            printf("  05 - LOW_RED_ONLY:                     %.3f\n", actionReward[ 5]);
+            printf("  06 - WHITE_AS_RED_THEN_LOW_RED:        %.3f\n", actionReward[ 6]);
+            printf("  07 - WHITE_AS_YELLOW_THEN_LOW_RED:     %.3f\n", actionReward[ 7]);
+            printf("  08 - WHITE_AS_GREEN_THEN_LOW_RED:      %.3f\n", actionReward[ 8]);
+            printf("  09 - WHITE_AS_BLUE_THEN_LOW_RED:       %.3f\n", actionReward[ 9]);
+            printf("  10 - LOW_YELLOW_ONLY:                  %.3f\n", actionReward[10]);
+            printf("  11 - WHITE_AS_RED_THEN_LOW_YELLOW:     %.3f\n", actionReward[11]);
+            printf("  12 - WHITE_AS_YELLOW_THEN_LOW_YELLOW:  %.3f\n", actionReward[12]);
+            printf("  13 - WHITE_AS_GREEN_THEN_LOW_YELLOW:   %.3f\n", actionReward[13]);
+            printf("  14 - WHITE_AS_BLUE_THEN_LOW_YELLOW:    %.3f\n", actionReward[14]);
+            printf("  15 - HI_GREEN_ONLY:                    %.3f\n", actionReward[15]);
+            printf("  16 - WHITE_AS_RED_THEN_HI_GREEN:       %.3f\n", actionReward[16]);
+            printf("  17 - WHITE_AS_YELLOW_THEN_HI_GREEN:    %.3f\n", actionReward[17]);
+            printf("  18 - WHITE_AS_GREEN_THEN_HI_GREEN:     %.3f\n", actionReward[18]);
+            printf("  19 - WHITE_AS_BLUE_THEN_HI_GREEN:      %.3f\n", actionReward[19]);
+            printf("  20 - HI_BLUE_ONLY:                     %.3f\n", actionReward[20]);
+            printf("  21 - WHITE_AS_RED_THEN_HI_BLUE:        %.3f\n", actionReward[21]);
+            printf("  22 - WHITE_AS_YELLOW_THEN_HI_BLUE:     %.3f\n", actionReward[22]);
+            printf("  23 - WHITE_AS_GREEN_THEN_HI_BLUE:      %.3f\n", actionReward[23]);
+            printf("  24 - WHITE_AS_BLUE_THEN_HI_BLUE:       %.3f\n", actionReward[24]);
+
+            // If it was possible to lock a color, then evaluate/print the additional options
+            if (w2_roll == 6 && r_roll == 6 && state.color[RED   ].numMarks >= 5)
+            {
+              printf("  25 - HI_RED_ONLY:                      %.3f\n", actionReward[25]);
+              printf("  26 - WHITE_AS_RED_THEN_HI_RED:         %.3f\n", actionReward[26]);
+              printf("  27 - WHITE_AS_YELLOW_THEN_HI_RED:      %.3f\n", actionReward[27]);
+              printf("  28 - WHITE_AS_GREEN_THEN_HI_RED:       %.3f\n", actionReward[28]);
+              printf("  29 - WHITE_AS_BLUE_THEN_HI_RED:        %.3f\n", actionReward[29]);
+            }
+            if (w2_roll == 6 && y_roll == 6 && state.color[YELLOW].numMarks >= 5)
+            {
+              printf("  30 - HI_YELLOW_ONLY:                   %.3f\n", actionReward[30]);
+              printf("  31 - WHITE_AS_RED_THEN_HI_YELLOW:      %.3f\n", actionReward[31]);
+              printf("  32 - WHITE_AS_YELLOW_THEN_HI_YELLOW:   %.3f\n", actionReward[32]);
+              printf("  33 - WHITE_AS_GREEN_THEN_HI_YELLOW:    %.3f\n", actionReward[33]);
+              printf("  34 - WHITE_AS_BLUE_THEN_HI_YELLOW:     %.3f\n", actionReward[34]);
+            }
+            if (w1_roll == 1 && g_roll == 1 && state.color[GREEN ].numMarks >= 5)
+            {
+              printf("  35 - LOW_GREEN_ONLY:                   %.3f\n", actionReward[35]);
+              printf("  36 - WHITE_AS_RED_THEN_LOW_GREEN:      %.3f\n", actionReward[36]);
+              printf("  37 - WHITE_AS_YELLOW_THEN_LOW_GREEN:   %.3f\n", actionReward[37]);
+              printf("  38 - WHITE_AS_GREEN_THEN_LOW_GREEN:    %.3f\n", actionReward[38]);
+              printf("  39 - WHITE_AS_BLUE_THEN_LOW_GREEN:     %.3f\n", actionReward[39]);
+            }
+            if (w1_roll == 1 && b_roll == 1 && state.color[BLUE  ].numMarks >= 5)
+            {
+              printf("  40 - LOW_BLUE_ONLY:                    %.3f\n", actionReward[40]);
+              printf("  41 - WHITE_AS_RED_THEN_LOW_BLUE:       %.3f\n", actionReward[41]);
+              printf("  42 - WHITE_AS_YELLOW_THEN_LOW_BLUE:    %.3f\n", actionReward[42]);
+              printf("  43 - WHITE_AS_GREEN_THEN_LOW_BLUE:     %.3f\n", actionReward[43]);
+              printf("  44 - WHITE_AS_BLUE_THEN_LOW_BLUE:      %.3f\n", actionReward[44]);
+            }
+          } // end if print_actions
+        }
+        else // Only save the best if we're running multiple states (i.e. generating the Wvec)
+        {
+          Wvec[s] = theWnext;
+        }
       } // end else game not over
     } // end else numPenalties < 4
-    if ((NUM_MARKOV_STATES - s) % 1000 == 0)
+    if (do_one_state == 0 && ((NUM_MARKOV_STATES - s) % 1000 == 0))
     {
       printf("% 8d / % 8d states complete\n", NUM_MARKOV_STATES - s, NUM_MARKOV_STATES);
     }
   } // end s loop
-} // end calculateWvec()
+} // end analyzeState()
 
 int main(int argc, char *argv[])
 {
     FILE *fp = NULL;
     char filenameBuf[128];
     int num_iterations = -1; // -1 means do all of them
+    int num_sim_games  = 0;
+    int start_seed     = 0;
+    int print_actions  = 0;
+
+    typedef enum
+    {
+      CHECKER_MODE,
+      SIM_MODE,
+      GENERATE_MODE
+    } RUN_MODE_TYPE;
+
+    RUN_MODE_TYPE run_type = (RUN_MODE_TYPE) -1;
 
     initLookupTables();
 
+    // Initialize Wvec[]
     Wvec = malloc(sizeof(float)*NUM_MARKOV_STATES);
     int i;
     for (i = 0; i < NUM_MARKOV_STATES; i++)
@@ -981,24 +1196,161 @@ int main(int argc, char *argv[])
       Wvec[i] = WVEC_END_OF_GAME;
     }
 
-    if (argc > 1)
+    // Decide which mode we're running in: CHECKER_MODE or GENERATE_MODE
+    if (access("qwixx.bin", R_OK) == 0)
     {
-      num_iterations = atoi(argv[1]);
-      printf("Overriding num_iterations for all to %d. Presumably this is a short timing run?\n", num_iterations);
+      if (argc > 2)
+      {
+        num_sim_games = atoi(argv[1]);
+        start_seed    = atoi(argv[2]);
+        run_type      = SIM_MODE;
+      }
+      else if (argc > 1)
+      {
+        num_sim_games = atoi(argv[1]);
+        run_type      = SIM_MODE;
+      }
+      else
+      {
+        printf("No arguments provided, but qwixx.bin exists, so entering 'play/check' mode.\n");
+        run_type = CHECKER_MODE;
+      }
+    }
+    else
+    {
+      printf("qwixx.bin DOES NOT exist, so entering 'generate' mode.\n");
+      run_type = GENERATE_MODE;
+      if (argc > 1)
+      {
+        num_iterations = atoi(argv[1]);
+        printf("Overriding num_iterations for all to %d. Presumably this is a short timing run?\n", num_iterations);
+      }
+
     }
 
-    calculateWvec(num_iterations);
-
-    snprintf(filenameBuf, sizeof(filenameBuf), "qwixx.bin");
-    printf("Saving results to %s ...\n", filenameBuf);
-    fp = fopen(filenameBuf,"wb");
-    if (fp)
+    if (run_type == CHECKER_MODE || run_type == SIM_MODE)
     {
-      fwrite(Wvec, sizeof(float)*NUM_MARKOV_STATES, 1, fp);
-      fclose(fp);
+      // Load Wvec from qwixx.bin
+      FILE *fp = fopen("qwixx.bin", "rb");
+      if (fp != NULL)
+      {
+        int num_items_read = fread(Wvec, sizeof(float), NUM_MARKOV_STATES, fp);
+        if (num_items_read != NUM_MARKOV_STATES)
+        {
+          printf("Error reading qwixx.bin (num_items_read = %d)! Aborting!\n", num_items_read);
+          exit(-1);
+        }
+        fclose(fp);
+      }
+      else
+      {
+        printf("Error opening qwixx.bin! Aborting!\n");
+        exit(-1);
+      }
     }
 
-    printf("Wvec[0] = %.2f\n", Wvec[0]);
+    if (run_type == CHECKER_MODE)
+    {
+      int scanf_return = 0;
+
+      QwixxState state;
+      initialize_qwixx_state(&state);
+
+      printf("Enter the board state, like this...\n");
+      printf("NumRedMarks LastRedMark NumYellowMarks LastYellowMark NumGreenMarks LastGreenMark NumBlueMarks LastBlueMark NumPenalties\n");
+      scanf_return = scanf("%d %d %d %d %d %d %d %d %d",
+        &state.color[RED   ].numMarks, &state.color[RED   ].rightMark,
+        &state.color[YELLOW].numMarks, &state.color[YELLOW].rightMark,
+        &state.color[GREEN ].numMarks, &state.color[GREEN ].rightMark,
+        &state.color[BLUE  ].numMarks, &state.color[BLUE  ].rightMark,
+        &state.numPenalties);
+      if (scanf_return != 9)
+      {
+        printf("Not enough inputs. scanf_return = %d. Exiting!\n", scanf_return);
+        exit(-1);
+      }
+
+      int w1, w2, r, y, g, b;
+      printf("Now enter the 6 dice like this: W1 W2 R Y G B\n");
+      scanf_return = scanf("%d %d %d %d %d %d", &w1, &w2, &r, &y, &g, &b);
+      if (scanf_return != 6)
+      {
+        printf("Not enough inputs. scanf_return = %d. Exiting!\n", scanf_return);
+        exit(-1);
+      }
+      if (w2 < w1)
+      {
+        SWAP_INT(w1, w2);
+      }
+
+      print_actions = 1; // we print the actions when in checker mode
+
+      while ( ! isGameOver(&state) )
+      {
+        analyzeState(&state, 0, w1, w2, r, y, g, b, print_actions);
+
+        // Prepare for next loop
+        printf("Let's roll again...\n");
+        printf("Now enter the 6 dice like this: W1 W2 R Y G B\n");
+        scanf_return = scanf("%d %d %d %d %d %d", &w1, &w2, &r, &y, &g, &b);
+
+        if (scanf_return != 6)
+        {
+          printf("Not enough inputs. scanf_return = %d. Exiting!\n", scanf_return);
+          exit(-1);
+        }
+        if (w2 < w1)
+        {
+          SWAP_INT(w1, w2);
+        }
+      }
+    }
+    else if (run_type == SIM_MODE)
+    {
+      int game_ix = 0;
+      if (num_sim_games == 1)
+      {
+        print_actions = 1; // print actions if we're only simulating one game; don't otherwise
+      }
+      for (game_ix = 0; game_ix < num_sim_games; game_ix++)
+      {
+        QwixxState state;
+        initialize_qwixx_state(&state);
+        srand( start_seed + game_ix );
+        while ( ! isGameOver(&state) )
+        {
+          int w1 = rand() % 6 + 1;
+          int w2 = rand() % 6 + 1;
+          int r  = rand() % 6 + 1;
+          int y  = rand() % 6 + 1;
+          int g  = rand() % 6 + 1;
+          int b  = rand() % 6 + 1;
+
+          if (w2 < w1)
+          {
+            SWAP_INT(w1, w2);
+          }
+
+          analyzeState(&state, 0, w1, w2, r, y, g, b, print_actions);
+        }
+        printf("Game %d got %d points\n", game_ix, getScore(&state));
+      } // end game_ix loop
+    }
+    else // run_type == GENERATE_MODE
+    {
+      analyzeState(NULL, num_iterations, 0, 0, 0, 0, 0, 0, print_actions);
+
+      snprintf(filenameBuf, sizeof(filenameBuf), "qwixx.bin");
+      printf("Saving results to %s ...\n", filenameBuf);
+      fp = fopen(filenameBuf,"wb");
+      if (fp)
+      {
+        fwrite(Wvec, sizeof(float)*NUM_MARKOV_STATES, 1, fp);
+        fclose(fp);
+      }
+
+      printf("Wvec[0] = %.2f\n", Wvec[0]);
+    }
 
     return 0;
 }
